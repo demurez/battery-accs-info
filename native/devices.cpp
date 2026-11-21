@@ -139,9 +139,11 @@ std::optional<Reading> StandardHid(HANDLE handle, const HidInterface& iface,
         return raw;
     });
     if (reply.empty()) return {};
-    return Reading{reply[profile.batteryOffset], profile.powerOffset && reply[profile.powerOffset]
-                      ? L"Питание по USB" : L"Подключено",false, !profile.powerOffset?PowerSource::Unknown:
-                      reply[profile.powerOffset]?PowerSource::External:PowerSource::Battery};
+    const int level=reply[profile.batteryOffset];
+    if(!profile.powerOffset)return Reading{level,L"Подключено"};
+    if(!reply[profile.powerOffset])return Reading{level,L"Подключено",false,PowerSource::Battery};
+    if(level==100)return Reading{level,L"Заряжено · USB",false,PowerSource::External};
+    return Reading{level,L"Заряжается · USB",false,PowerSource::LikelyCharging};
 }
 
 Bytes RaceReply(const Bytes& raw, unsigned group, unsigned seq) {
@@ -216,7 +218,7 @@ std::optional<Reading> Barracuda(HANDLE handle, const HidInterface& iface, const
                                                 10.0 * (mv - low) / (*pos - low)));
     }
     const bool likelyCharging=p.likelyChargingMv && mv>=p.likelyChargingMv;
-    return Reading{percent, likelyCharging?L"Вероятно заряжается · по напряжению":L"Оценка по напряжению",
+    return Reading{percent, likelyCharging?L"Вероятно заряжается":L"Подключено",
                    true, likelyCharging?PowerSource::LikelyCharging:PowerSource::Unknown};
 }
 

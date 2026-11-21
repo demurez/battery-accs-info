@@ -9,6 +9,7 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <winrt/base.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 
 #include "devices.hpp"
 #include "driver_install.hpp"
@@ -239,6 +240,7 @@ public:
             return 0;
         }
         case WM_SETTINGCHANGE:
+        case WM_DWMCOLORIZATIONCOLORCHANGED:
         case WM_THEMECHANGED: SetTheme(); return 0;
         case WM_MOUSEWHEEL: Scroll(GET_WHEEL_DELTA_WPARAM(w) > 0 ? -1 : 1); return 0;
         case WM_LBUTTONUP:
@@ -283,7 +285,7 @@ public:
                 if(hover_ && IsWindowVisible(hover_))InvalidateRect(hover_,nullptr,FALSE);
             } else if (w == HistoryTimer) {
                 if(IsWindowVisible(window_)) InvalidateRect(window_,nullptr,FALSE);
-                if(hover_ && IsWindowVisible(hover_)) ShowHover();
+                if(hover_ && IsWindowVisible(hover_)) ShowFlyout();
             } else if (w == AnimationTimer) {
                 if (!IsWindowVisible(window_) || IsIconic(window_) || Motion() >= 1)
                     KillTimer(window_, AnimationTimer);
@@ -327,8 +329,8 @@ public:
             return 0;
         }
         case TrayEvent:
-            if(LOWORD(l)==NIN_POPUPOPEN){ if(!flyoutOpen_)ShowHover(); return 0; }
-            if(LOWORD(l)==NIN_POPUPCLOSE){ if(hover_ && !flyoutOpen_)ShowWindow(hover_,SW_HIDE); UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE); return 0; }
+
+
             if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT || LOWORD(l) == WM_LBUTTONUP)
                 ToggleFlyout(LOWORD(l)==NIN_KEYSELECT);
             else if (LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_RBUTTONUP) TrayMenu();
@@ -462,14 +464,7 @@ private:
         for (size_t i = 0; i < cards_.size(); ++i) {
             auto& card = cards_[i];
             card.from += (card.to - card.from) * previous;
-            auto next=std::move(values[i]);
-            if(next.power==PowerSource::External && next.percent && *next.percent<100 &&
-               card.reading.percent && (card.reading.power==PowerSource::External || card.reading.power==PowerSource::Charging) &&
-               (*next.percent>*card.reading.percent || (card.reading.power==PowerSource::Charging && *next.percent==*card.reading.percent))){
-                next.power=PowerSource::Charging;
-                next.status=L"Заряжается · USB";
-            }
-            card.reading=std::move(next);
+            card.reading=std::move(values[i]);
             TrackCharge(card.charge,profiles_[i].file,card.reading);
             if (int(i)==driverRow_ && card.reading.percent && firstSampleNotice_) {
                 firstSampleNotice_=nullptr;
@@ -529,7 +524,7 @@ private:
     void UpdateDriverOffer() {
         if (!driverButton_) return;
         const bool matched = driverRow_ >= 0 && DirewolfPresent();
-        driverOffered_ = matched && !DirewolfDriverPresent() &&
+        driverOffered_ = matched && !ChargingIndicator(cards_[driverRow_].reading.power) && !DirewolfDriverPresent() &&
                          (VendorFilterInstalled() ? !VendorSamplerInstalled() && cards_[driverRow_].reading.status != L"По данным Space Station" : !cards_[driverRow_].reading.percent.has_value());
         if (!matched && !driverProcess_) {
             driverNotice_ = nullptr;
@@ -700,11 +695,22 @@ private:
 
     void UpdateTray(bool add = false) {
         auto tray = TrayData();
-        tray.uFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE;
+        tray.uFlags = NIF_TIP | NIF_SHOWTIP | NIF_ICON | NIF_MESSAGE;
         tray.uCallbackMessage = TrayEvent;
         tray.hIcon = icon_ ? icon_ : LoadIconW(nullptr, IDI_APPLICATION);
-        wcscpy_s(tray.szTip,L"Battery Monitor");
-        if (hover_ && IsWindowVisible(hover_)) ShowHover();
+        std::wstring tip;
+        for(size_t i=0;i<cards_.size();++i){
+            // Show the current reading only. A dash means there is no current sample.
+            auto line=profiles_[i].name.substr(0,28)+L"  "+Value(cards_[i].reading);
+            if(tip.size()+line.size()+1>=std::size(tray.szTip)){
+                if(tip.size()+2<std::size(tray.szTip))tip+=L"\n…";
+                break;
+            }
+            if(!tip.empty())tip+=L'\n';
+            tip+=line;
+        }
+        wcscpy_s(tray.szTip,tip.empty()?L"Battery Monitor":tip.c_str());
+        if (hover_ && IsWindowVisible(hover_)) ShowFlyout();
         if (add) {
             trayAdded_ = Shell_NotifyIconW(NIM_ADD, &tray) != FALSE;
             if (trayAdded_) { tray.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &tray); }
@@ -712,10 +718,41 @@ private:
     }
 
     bool chargeMotion_{};
-    float ChargeRadius() const {
-        return chargeMotion_?3.5f+0.9f*std::sin(float(GetTickCount64()%1800)*0.00349066f):3.5f;
-    }
-    HWND hover_{};
+    winrt::com_ptr<ID2D1PathGeometry> lightning_;
+
+    void DrawCharging(ID2D1RenderTarget* target,ID2D1SolidColorBrush* brush,
+                      D2D1_POINT_2F icon,D2D1_RECT_F track,unsigned accent,bool light){
+        if(!lightning_){
+            winrt::com_ptr<ID2D1PathGeometry> shape;
+            winrt::com_ptr<ID2D1GeometrySink> sink;
+            if(FAILED(direct2d_->CreatePathGeometry(shape.put())) || FAILED(shape->Open(sink.put())))return;
+            sink->BeginFigure(Point2F(2,-10),D2D1_FIGURE_BEGIN_FILLED);
+            const D2D1_POINT_2F edges[]{Point2F(-7,2),Point2F(-1,2),Point2F(-3,10),Point2F(7,-3),Point2F(1,-3)};
+            sink->AddLines(edges,UINT32(std::size(edges)));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            if(FAILED(sink->Close()))return;
+            lightning_=std::move(shape);
+        }
+        D2D1_MATRIX_3X2_F before;
+        target->GetTransform(&before);
+        target->SetTransform(D2D1::Matrix3x2F::Translation(icon.x,icon.y)*before);
+        brush->SetColor(ColorF(accent));
+        target->FillGeometry(lightning_.get(),brush);
+        target->SetTransform(before);
+        if(!chargeMotion_ || track.right<=track.left)return;
+        const float width=track.right-track.left;
+        const float phase=float(GetTickCount64()%1500)/1500.f;
+        const float trail=std::min(92.f,width*.55f);
+        const float head=track.left+phase*(width+trail);
+        target->PushAxisAlignedClip(track,D2D1_ANTIALIAS_MODE_ALIASED);
+        for(int i=0;i<18;++i){
+            const float u=float(i)/18;
+            brush->SetColor(ColorF(light?0x14334a:0xffffff,0.1f+0.76f*u*u));
+            const float x=head-trail+u*trail;
+            target->FillRectangle(RectF(x,track.top,x+trail/18+.25f,track.bottom),brush);
+        }
+        target->PopAxisAlignedClip();
+    }    HWND hover_{};
     winrt::com_ptr<ID2D1HwndRenderTarget> hoverTarget_;
     int hoverOffset_{}, hoverLimit_{};
     HWND miniRefresh_{}, miniOpen_{};
@@ -735,7 +772,7 @@ private:
         if(flyoutOpen_){CloseFlyout();return;}
         if(now-lastFlyoutDismiss_<200)return;
         flyoutOpen_=true;
-        ShowHover();
+        ShowFlyout();
         if(!hover_){flyoutOpen_=false;return;}
         SetForegroundWindow(hover_);
         SetFocus(keyboard?miniRefresh_:hover_);
@@ -763,7 +800,7 @@ private:
         BOOL motion=TRUE;
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&motion,0);
         if(visible && motion && std::ranges::any_of(cards_,[](const Card& c){return ChargingIndicator(c.reading.power);}))
-            SetTimer(window_,ChargingTimer,100,nullptr);
+            SetTimer(window_,ChargingTimer,66,nullptr);
         else KillTimer(window_,ChargingTimer);
         chargeMotion_=motion!=FALSE;
         if(visible && std::ranges::any_of(cards_,[](const Card& card){return card.charge.previousTick!=0;}))
@@ -808,6 +845,33 @@ private:
         return DefWindowProcW(hwnd,msg,w,l);
     }
 
+    bool flyoutGlass_{};
+    unsigned flyoutAccent_{Dark.accent};
+
+    void StyleFlyout(){
+        const BOOL dark=DarkMode();
+        HIGHCONTRASTW hc{sizeof(hc)};
+        SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0);
+        DWORD transparency=1,bytes=sizeof(transparency);
+        RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"EnableTransparency",RRF_RT_REG_DWORD,nullptr,&transparency,&bytes);
+        DwmSetWindowAttribute(hover_,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark));
+        DWM_SYSTEMBACKDROP_TYPE material=transparency && !(hc.dwFlags&HCF_HIGHCONTRASTON)?
+            DWMSBT_TRANSIENTWINDOW:DWMSBT_NONE;
+        const HRESULT applied=DwmSetWindowAttribute(hover_,DWMWA_SYSTEMBACKDROP_TYPE,&material,sizeof(material));
+        const int extent=SUCCEEDED(applied) && material==DWMSBT_TRANSIENTWINDOW?-1:0;
+        const MARGINS margins{extent,extent,extent,extent};
+        flyoutGlass_=SUCCEEDED(DwmExtendFrameIntoClientArea(hover_,&margins)) && extent==-1;
+        flyoutAccent_=theme_.accent;
+        try {
+            using namespace winrt::Windows::UI::ViewManagement;
+            auto c=UISettings().GetColorValue(dark?UIColorType::AccentLight2:UIColorType::AccentDark1);
+            flyoutAccent_=(unsigned(c.R)<<16)|(unsigned(c.G)<<8)|c.B;
+        } catch(const winrt::hresult_error&) {}
+        hoverTarget_=nullptr;
+        InvalidateRect(hover_,nullptr,FALSE);
+    }
+
     void PaintHover(HWND hwnd){
         EnsureFactories();
         RECT rc{}; GetClientRect(hwnd,&rc);
@@ -815,7 +879,7 @@ private:
         const float dpi=float(GetDpiForWindow(hwnd));
         if(!hoverTarget_)
             winrt::check_hresult(direct2d_->CreateHwndRenderTarget(
-                D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(),dpi,dpi),
+                D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),dpi,dpi),
                 D2D1::HwndRenderTargetProperties(hwnd,pixels),hoverTarget_.put()));
         auto rt=hoverTarget_.get();
         if(rt->GetPixelSize().width!=pixels.width || rt->GetPixelSize().height!=pixels.height)
@@ -830,11 +894,11 @@ private:
             rt->DrawText(value.c_str(),UINT32(value.size()),font,bounds,pen.get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
         };
         auto band=[&](float left,float top,float right,float bottom,float radius,unsigned color){
-            pen->SetColor(ColorF(color));
+            pen->SetColor(ColorF(color,flyoutGlass_ && color==theme_.card?0.68f:1.f));
             rt->FillRoundedRectangle(RoundedRect(RectF(left,top,right,bottom),radius,radius),pen.get());
         };
         rt->BeginDraw();
-        rt->Clear(ColorF(theme_.background));
+        rt->Clear(flyoutGlass_?ColorF(0,0.f):ColorF(theme_.background));
         text(L"Заряд устройств",name_.get(),RectF(18,14,width-108,44),theme_.text);
         if(!lastTime_.empty())text(L"На "+lastTime_,small_.get(),RectF(width-108,17,width-18,42),theme_.secondary,true);
         rt->PushAxisAlignedClip(RectF(0,50,width,rt->GetSize().height-(flyoutOpen_?50.f:6.f)),D2D1_ANTIALIAS_MODE_ALIASED);
@@ -846,13 +910,9 @@ private:
             if(y+83+extra<50 || y>=rt->GetSize().height)continue;
             const auto& c=cards_[i];
             const auto level=c.last?c.last->percent:c.reading.percent;
-            const unsigned accent=!c.reading.percent?theme_.secondary:*c.reading.percent<=20?theme_.amber:theme_.accent;
+            const unsigned accent=!c.reading.percent?theme_.secondary:*c.reading.percent<=20?theme_.amber:flyoutAccent_;
             band(10,y,width-10,y+83+extra,9,theme_.card);
             text(profiles_[i].name,name_.get(),RectF(22,y+6,width-96,y+30),theme_.text);
-            if(ChargingIndicator(c.reading.power)){
-                auto r=ChargeRadius();pen->SetColor(ColorF(theme_.accent));
-                rt->FillEllipse(D2D1::Ellipse(Point2F(width-96,y+16),r,r),pen.get());
-            }
             text(CardValue(i),name_.get(),RectF(width-95,y+6,width-22,y+30),accent,true);
             std::wstring status=int(i)==driverRow_ && firstSampleNotice_ && !c.reading.percent ?
                 firstSampleNotice_:c.reading.status;
@@ -864,12 +924,16 @@ private:
             if(c.charge.data.full)text((profiles_[i].protocol==L"airoha-ystech"?L"Оценка 100% · ":L"Полный заряд · ")+LocalStamp(c.charge.data.full),small_.get(),
                                        RectF(22,y+67,width-20,y+85),theme_.secondary);
             band(22,y+72+extra,width-22,y+76+extra,2,theme_.track);
-            if(level && *level>0)band(22,y+72+extra,22+(width-44)*(*level)/100.f,y+76+extra,2,accent);
+            const float end=level?22+(width-44)*(*level)/100.f:22;
+            if(end>22)band(22,y+72+extra,end,y+76+extra,2,accent);
+            if(ChargingIndicator(c.reading.power))
+                DrawCharging(rt,pen.get(),Point2F(width-94,y+17),
+                    RectF(22,y+72+extra,end>22?end:width-22,y+76+extra),flyoutAccent_,theme_.background==Light.background);
         }
         rt->PopAxisAlignedClip();
         if(FAILED(rt->EndDraw()))hoverTarget_=nullptr;
     }
-    void ShowHover() {
+    void ShowFlyout() {
         auto tray=TrayData();
         NOTIFYICONIDENTIFIER id{sizeof(id)};
         id.hWnd=tray.hWnd;
@@ -898,8 +962,7 @@ private:
             };
             miniRefresh_=button(Refresh,L"Обновить");
             miniOpen_=button(Open,L"Открыть приложение");
-            BOOL dark=DarkMode();
-            DwmSetWindowAttribute(hover_,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark));
+            StyleFlyout();
             DWM_WINDOW_CORNER_PREFERENCE corners=DWMWCP_ROUND;
             DwmSetWindowAttribute(hover_,DWMWA_WINDOW_CORNER_PREFERENCE,&corners,sizeof(corners));
         }
@@ -973,7 +1036,7 @@ private:
         BOOL dark = DarkMode();
         theme_ = dark ? Dark : Light;
         DwmSetWindowAttribute(window_, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-        if(hover_){ DwmSetWindowAttribute(hover_,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark)); InvalidateRect(hover_,nullptr,FALSE); }
+        if(hover_)StyleFlyout();
         if (driverButton_) InvalidateRect(driverButton_, nullptr, TRUE);
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -1101,16 +1164,14 @@ private:
             const bool current = card.reading.percent.has_value();
             const auto chargeColor = !current ? theme_.secondary :
                                      *card.reading.percent <= 20 ? theme_.amber : theme_.accent;
-            if(!offer && ChargingIndicator(card.reading.power)){
-                brush_->SetColor(ColorF(theme_.accent));
-                const auto r=ChargeRadius();
-                render_->FillEllipse(D2D1::Ellipse(Point2F(right-83,y+23),r,r),brush_.get());
-            }
             if (!offer)
                 Text(CardValue(index), percent_.get(), RectF(right - 88, y + 7, right, y + 38), chargeColor, true);
             Round(RectF(left, y + 88, right, y + 93), 2.5f, theme_.track);
             float fill = (card.from + (card.to - card.from) * motion) / 100 * (right - left);
             if (fill > 0) Round(RectF(left, y + 88, left + fill, y + 93), 2.5f, chargeColor);
+            if(!offer && ChargingIndicator(card.reading.power))
+                DrawCharging(render_.get(),brush_.get(),Point2F(right-84,y+23),
+                    RectF(left,y+88,fill>0?left+fill:right,y+93),theme_.accent,theme_.background==Light.background);
         }
         const float foot = Top + Row * VisibleRows() + 8;
         const auto footer = summaryFailed_ ? L"Сводка Windows недоступна" :
