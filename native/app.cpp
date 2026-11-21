@@ -850,6 +850,7 @@ private:
     }
 
     bool flyoutGlass_{};
+    bool flyoutSeeThrough_{};
     unsigned flyoutAccent_{Dark.accent};
     winrt::com_ptr<IDWriteTextFormat> flyoutIcons_;
     bool FlyoutDark() const { return theme_.background==Dark.background; }
@@ -919,10 +920,24 @@ private:
         RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
                      L"EnableTransparency",RRF_RT_REG_DWORD,nullptr,&transparency,&bytes);
         DwmSetWindowAttribute(hover_,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark));
-        DWM_SYSTEMBACKDROP_TYPE material=transparency && !(hc.dwFlags&HCF_HIGHCONTRASTON)?
-            DWMSBT_TRANSIENTWINDOW:DWMSBT_NONE;
-        const HRESULT applied=DwmSetWindowAttribute(hover_,DWMWA_SYSTEMBACKDROP_TYPE,&material,sizeof(material));
-        const int extent=SUCCEEDED(applied) && material==DWMSBT_TRANSIENTWINDOW?-1:0;
+        const bool glass=transparency && !(hc.dwFlags&HCF_HIGHCONTRASTON);
+        // The system transient backdrop sets its own tint. The composition accent
+        // supplies the live background while Direct2D controls the overlay opacity.
+        struct AccentPolicy { int state, flags; DWORD color; int animation; };
+        struct AttributeData { int attribute; void* data; SIZE_T size; };
+        using SetAttribute=BOOL(WINAPI*)(HWND,AttributeData*);
+        static const auto setAttribute=std::bit_cast<SetAttribute>(GetProcAddress(
+            GetModuleHandleW(L"user32.dll"),"SetWindowCompositionAttribute"));
+        DWM_SYSTEMBACKDROP_TYPE material=DWMSBT_NONE;
+        DwmSetWindowAttribute(hover_,DWMWA_SYSTEMBACKDROP_TYPE,&material,sizeof(material));
+        AccentPolicy accent{glass?3:0,0,0,0}; // ACCENT_ENABLE_BLURBEHIND / ACCENT_DISABLED
+        AttributeData attribute{19,&accent,sizeof(accent)}; // WCA_ACCENT_POLICY
+        flyoutSeeThrough_=setAttribute && setAttribute(hover_,&attribute) && glass;
+        if(glass && !flyoutSeeThrough_)material=DWMSBT_TRANSIENTWINDOW;
+        bool backdrop=flyoutSeeThrough_;
+        if(material==DWMSBT_TRANSIENTWINDOW)
+            backdrop=SUCCEEDED(DwmSetWindowAttribute(hover_,DWMWA_SYSTEMBACKDROP_TYPE,&material,sizeof(material)));
+        const int extent=backdrop?-1:0;
         const MARGINS margins{extent,extent,extent,extent};
         flyoutGlass_=SUCCEEDED(DwmExtendFrameIntoClientArea(hover_,&margins)) && extent==-1;
         flyoutAccent_=theme_.accent;
@@ -966,7 +981,8 @@ private:
             rt->FillRoundedRectangle(RoundedRect(RectF(left,top,right,bottom),radius,radius),pen.get());
         };
         rt->BeginDraw();
-        rt->Clear(flyoutGlass_?ColorF(0,dark?.30f:0.f):ColorF(dark?0x252525:0xf9f9f9));
+        rt->Clear(!flyoutGlass_?ColorF(dark?0x252525:0xf9f9f9):
+            flyoutSeeThrough_?ColorF(dark?0x151515:0xffffff,dark?.62f:.67f):ColorF(0,dark?.30f:0.f));
         text(L"Заряд устройств",name_.get(),RectF(20,15,width-110,44),primary);
         if(!lastTime_.empty())text(lastTime_,small_.get(),RectF(width-108,18,width-20,42),secondary,true);
         rt->PushAxisAlignedClip(RectF(0,50,width,footerTop),D2D1_ANTIALIAS_MODE_ALIASED);
