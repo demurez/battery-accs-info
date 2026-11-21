@@ -31,8 +31,8 @@ using D2D1::RectF;
 using D2D1::RoundedRect;
 
 constexpr wchar_t WindowClass[] = L"PeripheralCharge.Window";
-constexpr UINT BatteryReady = WM_APP + 1, TrayEvent = WM_APP + 2;
-constexpr UINT_PTR AnimationTimer = 1, PlugTimer = 2, DriverTimer = 4;
+constexpr UINT BatteryReady = WM_APP + 1, TrayEvent = WM_APP + 2, SampleChanged = WM_APP + 3;
+constexpr UINT_PTR AnimationTimer = 1, PlugTimer = 2, DriverTimer = 4, FirstSampleTimer = 5;
 constexpr int Open = 101, Refresh = 102, Summary = 103, Quit = 104, Publish = 105, InstallDriver = 106;
 constexpr float Width = 536, Top = 119, Row = 94, Bottom = 54, Margin = 26;
 constexpr int InstallWidth = 154, InstallHeight = 32;
@@ -106,6 +106,7 @@ public:
         }
         wake_.notify_one();
         if (worker_.joinable()) worker_.join();
+        StopSampleWatch();
 
         if (driverProcess_) CloseHandle(driverProcess_);
         if (icon_) DestroyIcon(icon_);
@@ -128,6 +129,7 @@ public:
         filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
         filter.dbcc_classguid = hidClass;
         deviceChanges_ = RegisterDeviceNotificationW(window_, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+        ArmSampleWatch();
         AddTray();
         worker_ = std::thread([this, local = profiles_] { Work(local); });
         if (!trayOnly || !trayAdded_) ShowWindow(window_, SW_SHOW);
@@ -204,6 +206,12 @@ public:
                 KillTimer(window_, PlugTimer);
                 UpdateDriverOffer();
                 Request(true);
+            } else if (w == FirstSampleTimer) {
+                KillTimer(window_, FirstSampleTimer);
+                if (firstSampleNotice_) {
+                    firstSampleNotice_=L"Включите геймпад или переподключите донгл";
+                    Request(true);
+                }
             } else if (w == DriverTimer) {
                 FinishDriverInstall();
             }
@@ -216,6 +224,10 @@ public:
             if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND)
                 SetTimer(window_, PlugTimer, 2000, nullptr);
             return TRUE;
+        case SampleChanged:
+            ArmSampleWatch();
+            Request(true);
+            return 0;
         case BatteryReady: {
             std::vector<Reading> result;
             std::vector<Profile> updated;
@@ -361,6 +373,10 @@ private:
             auto& card = cards_[i];
             card.from += (card.to - card.from) * previous;
             card.reading = std::move(values[i]);
+            if (int(i)==driverRow_ && card.reading.percent && firstSampleNotice_) {
+                firstSampleNotice_=nullptr;
+                KillTimer(window_, FirstSampleTimer);
+            }
             if (card.reading.percent) card.last = card.reading;
             card.to = card.last && card.last->percent ? float(*card.last->percent) : 0;
             animate |= card.from != card.to;
@@ -448,6 +464,33 @@ private:
         UpdateDriverOffer();
     }
 
+    HKEY sampleKey_{};
+    HANDLE sampleEvent_{}, sampleWait_{};
+    const wchar_t* firstSampleNotice_{};
+
+    void StopSampleWatch() {
+        if(sampleWait_) UnregisterWaitEx(sampleWait_,INVALID_HANDLE_VALUE);
+        if(sampleKey_) RegCloseKey(sampleKey_);
+        if(sampleEvent_) CloseHandle(sampleEvent_);
+        sampleWait_=nullptr;
+        sampleKey_=nullptr;
+        sampleEvent_=nullptr;
+    }
+
+    static void CALLBACK NotifySample(void* context,BOOLEAN) {
+        PostMessageW(static_cast<HWND>(context),SampleChanged,0,0);
+    }
+
+    void ArmSampleWatch() {
+        StopSampleWatch();
+        if(RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Battery Monitor\\Flydigi",0,
+                         KEY_NOTIFY,&sampleKey_)!=ERROR_SUCCESS)return;
+        sampleEvent_=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        if(!sampleEvent_ ||
+           RegNotifyChangeKeyValue(sampleKey_,FALSE,REG_NOTIFY_CHANGE_LAST_SET,sampleEvent_,TRUE)!=ERROR_SUCCESS ||
+           !RegisterWaitForSingleObject(&sampleWait_,sampleEvent_,NotifySample,window_,INFINITE,WT_EXECUTEONLYONCE))
+            StopSampleWatch();
+    }
     void FinishDriverInstall() {
         if (!driverProcess_ || WaitForSingleObject(driverProcess_, 0) == WAIT_TIMEOUT) return;
         KillTimer(window_, DriverTimer);
@@ -456,10 +499,16 @@ private:
         CloseHandle(driverProcess_);
         driverProcess_ = nullptr;
         driverReboot_ = status == ERROR_SUCCESS_REBOOT_REQUIRED || status == ERROR_SUCCESS_RESTART_REQUIRED;
+        if(status==0 || status==DriverReconnectNeeded) {
+            firstSampleNotice_=status==DriverReconnectNeeded
+                ? L"Выньте и снова вставьте USB-донгл" : L"Ожидание заряда от геймпада";
+            if(status==0)SetTimer(window_,FirstSampleTimer,12000,nullptr);
+            ArmSampleWatch();
+        }
         if (driverReboot_) driverNotice_ = L"Перезапуск активирует драйвер";
         else if (status == DriverDeviceMissing) driverNotice_ = L"Донгл отключён";
         else if (status == DriverPackageMissing) driverNotice_ = L"Пакет пока недоступен";
-        else if (status != 0) driverNotice_ = L"Драйвер установить не удалось";
+        else if (status != 0 && status != DriverReconnectNeeded) driverNotice_ = L"Драйвер установить не удалось";
         else driverNotice_ = nullptr;
         UpdateDriverOffer();
         Request(true);
@@ -725,7 +774,8 @@ private:
             const float detailRight = offer ? right - InstallWidth - 12 : right;
             Text(profile.name, name_.get(), RectF(left, y + 11, offer ? detailRight : right - 85, y + 37), theme_.text);
             std::wstring detail;
-            if (offer && driverNotice_) detail=driverNotice_;
+            if (int(index)==driverRow_ && firstSampleNotice_ && !card.reading.percent) detail=firstSampleNotice_;
+            else if (offer && driverNotice_) detail=driverNotice_;
             else if (offer && card.reading.percent) detail=CardValue(index)+L" · "+card.reading.status;
             else if (offer) detail=VendorFilterInstalled()?L"Доступен автоопрос":L"Драйвер для чтения заряда";
             else if (card.last && !card.reading.percent) detail = L"Последнее значение · " + card.reading.status;

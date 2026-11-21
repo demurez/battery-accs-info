@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <cfgmgr32.h>
+#include <usbioctl.h>
 #include <objbase.h>
 #include <sddl.h>
 #include <setupapi.h>
@@ -98,8 +99,7 @@ std::filesystem::path SystemFolder() {
 constexpr wchar_t ReaderName[]=L"BatteryMonitorFlydigiSample.exe";
 constexpr wchar_t TaskName[]=L"Battery Monitor - Flydigi charge";
 
-DWORD TaskCommand(const std::wstring& arguments) {
-    auto exe=SystemFolder()/L"schtasks.exe";
+DWORD RunTool(const std::filesystem::path& exe,const std::wstring& arguments) {
     auto command=L"\""+exe.wstring()+L"\" "+arguments;
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
@@ -185,6 +185,47 @@ int EnsureFilter() {
     if(!StartServiceW(service.h,0,nullptr) && GetLastError()!=ERROR_SERVICE_ALREADY_RUNNING)return DriverSetupError;
     return 0;
 }
+bool CycleDirewolfPort() {
+    GUID hubInterface{0xf18a0e88,0xc30c,0x11d0,{0x88,0x15,0x00,0xa0,0xc9,0x06,0xbe,0xd8}};
+    wchar_t id[]=DIREWOLF_USB_INSTANCE;
+    DEVINST device{},parent{};
+    wchar_t parentId[MAX_DEVICE_ID_LEN]{}, driverKey[256]{};
+    DWORD port{},type{},size=sizeof(port);
+    if(CM_Locate_DevNodeW(&device,id,CM_LOCATE_DEVNODE_NORMAL)!=CR_SUCCESS ||
+       CM_Get_Parent(&parent,device,0)!=CR_SUCCESS ||
+       CM_Get_Device_IDW(parent,parentId,MAX_DEVICE_ID_LEN,0)!=CR_SUCCESS ||
+       CM_Get_DevNode_Registry_PropertyW(device,CM_DRP_ADDRESS,&type,&port,&size,0)!=CR_SUCCESS ||
+       type!=REG_DWORD || !port)return false;
+    size=sizeof(driverKey);
+    if(CM_Get_DevNode_Registry_PropertyW(device,CM_DRP_DRIVER,&type,driverKey,&size,0)!=CR_SUCCESS ||
+       type!=REG_SZ || !size || driverKey[255])return false;
+    ULONG chars{};
+    if(CM_Get_Device_Interface_List_SizeW(&chars,&hubInterface,parentId,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT)!=CR_SUCCESS || chars<2)return false;
+    std::vector<wchar_t> path(chars);
+    if(CM_Get_Device_Interface_ListW(&hubInterface,parentId,path.data(),chars,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT)!=CR_SUCCESS || !path[0])return false;
+    HANDLE hub=CreateFileW(path.data(),GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,
+                           OPEN_EXISTING,0,nullptr);
+    if(hub==INVALID_HANDLE_VALUE)return false;
+    alignas(USB_NODE_CONNECTION_DRIVERKEY_NAME) BYTE buffer[2048]{};
+    auto key=reinterpret_cast<PUSB_NODE_CONNECTION_DRIVERKEY_NAME>(buffer);
+    key->ConnectionIndex=port;
+    DWORD count{};
+    // Match the port's current driver key as well as the exact PnP instance.
+    bool match=DeviceIoControl(hub,IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME,buffer,sizeof(buffer),
+                               buffer,sizeof(buffer),&count,nullptr) &&
+               count<=sizeof(buffer) && count>=offsetof(USB_NODE_CONNECTION_DRIVERKEY_NAME,DriverKeyName)+sizeof(wchar_t) &&
+               key->ActualLength<=count &&
+               wcsnlen(key->DriverKeyName,(sizeof(buffer)-offsetof(USB_NODE_CONNECTION_DRIVERKEY_NAME,DriverKeyName))/2)==wcslen(driverKey) &&
+               !_wcsicmp(key->DriverKeyName,driverKey);
+    USB_CYCLE_PORT_PARAMS cycle{};
+    cycle.ConnectionIndex=port;
+    bool cycled=match && DirewolfPresent() && DeviceIoControl(hub,IOCTL_USB_HUB_CYCLE_PORT,&cycle,sizeof(cycle),
+                                        &cycle,sizeof(cycle),&count,nullptr) && cycle.StatusReturned==0;
+    CloseHandle(hub);
+    return cycled;
+}
 int InstallVendorSampler() {
     const auto resource=FindResourceW(nullptr,MAKEINTRESOURCEW(301),RT_RCDATA);
     const DWORD size=resource?SizeofResource(nullptr,resource):0;
@@ -202,17 +243,32 @@ int InstallVendorSampler() {
     if(!ok || !MoveFileExW(temporary.c_str(),dest.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){
         DeleteFileW(temporary.c_str());
         return DriverSetupError;
-    }    const std::wstring task=L"/TN \""+std::wstring(TaskName)+L"\"";
+    }
+    const std::wstring task=L"/TN \""+std::wstring(TaskName)+L"\"";
     // System32 is protected. Only this embedded, argument-free reader runs elevated.
-    if(TaskCommand(L"/Create /F "+task+L" /SC MINUTE /MO 1 /RU SYSTEM /TR \"\\\""+
+    if(RunTool(SystemFolder()/L"schtasks.exe",L"/Create /F "+task+L" /SC MINUTE /MO 1 /RU SYSTEM /TR \"\\\""+
                            dest.wstring()+L"\\\"\"")!=0){
         // Keep the installed reader for a retry or an existing scheduled task.
         return DriverSetupError;
     }
-    if(TaskCommand(L"/Run "+task)!=0)return DriverSetupError;
+
     DWORD enabled=1;
-    return RegSetKeyValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Battery Monitor\\Flydigi",L"AutoPoll",
-        REG_DWORD,&enabled,sizeof(enabled))==ERROR_SUCCESS ? 0 : DriverSetupError;
+    if(RegSetKeyValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Battery Monitor\\Flydigi",L"AutoPoll",
+        REG_DWORD,&enabled,sizeof(enabled))!=ERROR_SUCCESS)return DriverSetupError;
+    DWORD result=RunTool(dest,L"");
+    if(result!=SamplerPortNotReady)return 0;
+    Sleep(500);
+    result=RunTool(dest,L"");
+    if(result!=SamplerPortNotReady)return 0;
+    if(CycleDirewolfPort()){
+        for(int attempt=0;attempt<8;++attempt){
+            Sleep(1000);
+            result=RunTool(dest,L"");
+            if(result==0)return 0;
+            if(result!=1 && result!=SamplerPortNotReady)return 0;
+        }
+    }
+    return DriverReconnectNeeded;
 }
 }
 

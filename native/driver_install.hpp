@@ -13,3 +13,5 @@ HANDLE StartDirewolfDriverInstall(HWND owner, DWORD& error);
 int InstallDirewolfDriver();
 bool VendorFilterInstalled();
 bool VendorSamplerInstalled();
+inline constexpr int SamplerPortNotReady = 10;
+inline constexpr int DriverReconnectNeeded = 11;

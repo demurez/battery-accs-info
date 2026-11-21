@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <tlhelp32.h>
+#include "driver_install.hpp"
 #include <cfgmgr32.h>
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "fltLib.lib")
@@ -43,7 +44,8 @@ int main() {
     if (FAILED(FilterConnectCommunicationPort(L"\\XboxFilterPort", 0, nullptr, 0, nullptr, &port))) return 2;
     HANDLE dev = CreateFileW(L"\\\\.\\XboxFilter", GENERIC_ALL, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     DWORD count{}, ready{};
-    if (!DeviceIoControl(dev, 0xc07fe008, nullptr, 0, &ready, sizeof(ready), &count, nullptr) || !ready) return 3;
+    if (!DeviceIoControl(dev, 0xc07fe008, nullptr, 0, &ready, sizeof(ready), &count, nullptr)) return 3;
+    if (!ready) return SamplerPortNotReady;
     std::array<BYTE,15> request{0xa5,0x10,static_cast<BYTE>(GetTickCount64())};
     OVERLAPPED ov{};
     ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
