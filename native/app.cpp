@@ -966,7 +966,7 @@ private:
             rt->FillRoundedRectangle(RoundedRect(RectF(left,top,right,bottom),radius,radius),pen.get());
         };
         rt->BeginDraw();
-        rt->Clear(flyoutGlass_?ColorF(0,0.f):ColorF(dark?0x2c2c2c:0xf9f9f9));
+        rt->Clear(flyoutGlass_?ColorF(0,dark?.30f:0.f):ColorF(dark?0x252525:0xf9f9f9));
         text(L"Заряд устройств",name_.get(),RectF(20,15,width-110,44),primary);
         if(!lastTime_.empty())text(lastTime_,small_.get(),RectF(width-108,18,width-20,42),secondary,true);
         rt->PushAxisAlignedClip(RectF(0,50,width,footerTop),D2D1_ANTIALIAS_MODE_ALIASED);
