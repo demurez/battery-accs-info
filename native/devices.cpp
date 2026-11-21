@@ -381,15 +381,6 @@ Reading Gamepad(const Profile& profile, bool trace) {
         for (auto pad : RawGameController::RawGameControllers()) {
             std::wstring name = pad.DisplayName().c_str(), lowered = name;
             std::transform(lowered.begin(), lowered.end(), lowered.begin(), towlower);
-            auto report = pad.TryGetBatteryReport();
-            auto full = report.FullChargeCapacityInMilliwattHours();
-            auto left = report.RemainingCapacityInMilliwattHours();
-            if (trace) {
-                std::wcout << L"  Windows.Gaming.Input: " << name << L" "
-                           << std::hex << pad.HardwareVendorId() << L":" << pad.HardwareProductId()
-                           << std::dec << L" remaining=" << (left ? left.Value() : -1)
-                           << L" full=" << (full ? full.Value() : -1) << L'\n';
-            }
             // 045E:028E belongs to generic XInput devices too, so it cannot identify this pad.
             bool named = lowered.find(L"direwolf 4") != std::wstring::npos ||
                          lowered.find(L"冰原狼 4") != std::wstring::npos;
@@ -397,6 +388,13 @@ Reading Gamepad(const Profile& profile, bool trace) {
                              std::ranges::find(profile.pids, pad.HardwareProductId()) != profile.pids.end();
             if (!named && !matchedId) continue;
             found = true;
+            auto report = pad.TryGetBatteryReport();
+            if (!report) continue;
+            auto full = report.FullChargeCapacityInMilliwattHours();
+            auto left = report.RemainingCapacityInMilliwattHours();
+            if (trace) std::wcout << L"  Windows.Gaming.Input: " << name
+                                  << L" remaining=" << (left ? left.Value() : -1)
+                                  << L" full=" << (full ? full.Value() : -1) << L'\n';
             if (left && full && left.Value() >= 0 && full.Value() > 0)
                 return {std::clamp(int(std::lround(100.0 * left.Value() / full.Value())), 0, 100),
                         L"По данным Windows"};

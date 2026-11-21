@@ -6,6 +6,10 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <commctrl.h>
+#include <uxtheme.h>
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <winrt/base.h>
@@ -833,7 +837,7 @@ private:
             return 0;
         }
         if(self && msg==WM_DRAWITEM){
-            self->DrawActionButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(l));
+            self->DrawFlyoutCommand(*reinterpret_cast<const DRAWITEMSTRUCT*>(l));
             return TRUE;
         }
         if(msg==WM_MOUSEACTIVATE)return self && self->flyoutOpen_?MA_ACTIVATE:MA_NOACTIVATE;
@@ -847,6 +851,65 @@ private:
 
     bool flyoutGlass_{};
     unsigned flyoutAccent_{Dark.accent};
+    winrt::com_ptr<IDWriteTextFormat> flyoutIcons_;
+    bool FlyoutDark() const { return theme_.background==Dark.background; }
+    unsigned FooterColor() const { return FlyoutDark()?0x252525:0xf3f3f3; }
+
+    static LRESULT CALLBACK CommandButtonProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR){
+        if(msg==WM_MOUSEMOVE){
+            TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,hwnd,0};
+            TrackMouseEvent(&tracking);
+            InvalidateRect(hwnd,nullptr,FALSE);
+        } else if(msg==WM_MOUSELEAVE) InvalidateRect(hwnd,nullptr,FALSE);
+        return DefSubclassProc(hwnd,msg,w,l);
+    }
+
+    void DrawFlyoutCommand(const DRAWITEMSTRUCT& item) const {
+        const int dpi=GetDpiForWindow(item.hwndItem);
+        auto px=[dpi](int x){return MulDiv(x,dpi,96);};
+        auto rgb=[](unsigned c){return RGB(c>>16,(c>>8)&255,c&255);};
+        POINT mouse{};
+        GetCursorPos(&mouse);
+        const bool hot=WindowFromPoint(mouse)==item.hwndItem;
+        const bool pressed=item.itemState&ODS_SELECTED, disabled=item.itemState&ODS_DISABLED;
+        HDC dc{};
+        auto buffer=BeginBufferedPaint(item.hDC,&item.rcItem,BPBF_TOPDOWNDIB,nullptr,&dc);
+        if(!buffer)dc=item.hDC;
+        const int saved=SaveDC(dc);
+        SelectObject(dc,GetStockObject(DC_BRUSH));
+        SelectObject(dc,GetStockObject(NULL_PEN));
+        SetDCBrushColor(dc,rgb(FooterColor()));
+        FillRect(dc,&item.rcItem,(HBRUSH)GetStockObject(DC_BRUSH));
+        RECT r=item.rcItem;
+        if(!disabled && (hot || pressed)){
+            SetDCBrushColor(dc,rgb(FlyoutDark()?(pressed?0x303030:0x393939):(pressed?0xe9e9e9:0xe4e4e4)));
+            RoundRect(dc,r.left,r.top,r.right,r.bottom,px(8),px(8));
+        }
+        SetBkMode(dc,TRANSPARENT);
+        SetTextColor(dc,rgb(disabled?(FlyoutDark()?0x929292:0x747474):(FlyoutDark()?0xffffff:0x191919)));
+        auto draw=[&](const wchar_t* value,const wchar_t* family,int size,RECT bounds){
+            HFONT font=CreateFontW(-px(size),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+                0,0,CLEARTYPE_QUALITY,0,family);
+            auto previous=SelectObject(dc,font);
+            DrawTextW(dc,value,-1,&bounds,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+            SelectObject(dc,previous);
+            DeleteObject(font);
+        };
+        r.left+=px(10);
+        draw(item.CtlID==Refresh?L"\uE72C":L"\uE8A7",L"Segoe Fluent Icons",16,r);
+        r.left+=px(25);
+        wchar_t label[64]{};
+        GetWindowTextW(item.hwndItem,label,64);
+        draw(label,L"Segoe UI Variable Text",14,r);
+        if((item.itemState&ODS_FOCUS) && !(item.itemState&ODS_NOFOCUSRECT)){
+            RECT focus=item.rcItem; InflateRect(&focus,-2,-2); DrawFocusRect(dc,&focus);
+        }
+        RestoreDC(dc,saved);
+        if(buffer){
+            BufferedPaintSetAlpha(buffer,&item.rcItem,255);
+            EndBufferedPaint(buffer,TRUE);
+        }
+    }
 
     void StyleFlyout(){
         const BOOL dark=DarkMode();
@@ -888,20 +951,25 @@ private:
         winrt::com_ptr<ID2D1SolidColorBrush> pen;
         winrt::check_hresult(rt->CreateSolidColorBrush(ColorF(theme_.text),pen.put()));
         const float width=rt->GetSize().width;
+        const float footerTop=rt->GetSize().height-56;
+        const bool dark=FlyoutDark();
+        const unsigned primary=dark?0xffffff:0x191919, secondary=dark?0xc8c8c8:0x606060;
+        if(!flyoutIcons_)winrt::check_hresult(directWrite_->CreateTextFormat(L"Segoe Fluent Icons",nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,20,L"ru-RU",flyoutIcons_.put()));
         auto text=[&](const std::wstring& value,IDWriteTextFormat* font,D2D1_RECT_F bounds,unsigned color,bool right=false){
             pen->SetColor(ColorF(color));
             font->SetTextAlignment(right?DWRITE_TEXT_ALIGNMENT_TRAILING:DWRITE_TEXT_ALIGNMENT_LEADING);
             rt->DrawText(value.c_str(),UINT32(value.size()),font,bounds,pen.get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
         };
         auto band=[&](float left,float top,float right,float bottom,float radius,unsigned color){
-            pen->SetColor(ColorF(color,flyoutGlass_ && color==theme_.card?0.68f:1.f));
+            pen->SetColor(ColorF(color));
             rt->FillRoundedRectangle(RoundedRect(RectF(left,top,right,bottom),radius,radius),pen.get());
         };
         rt->BeginDraw();
-        rt->Clear(flyoutGlass_?ColorF(0,0.f):ColorF(theme_.background));
-        text(L"Заряд устройств",name_.get(),RectF(18,14,width-108,44),theme_.text);
-        if(!lastTime_.empty())text(L"На "+lastTime_,small_.get(),RectF(width-108,17,width-18,42),theme_.secondary,true);
-        rt->PushAxisAlignedClip(RectF(0,50,width,rt->GetSize().height-(flyoutOpen_?50.f:6.f)),D2D1_ANTIALIAS_MODE_ALIASED);
+        rt->Clear(flyoutGlass_?ColorF(0,0.f):ColorF(dark?0x2c2c2c:0xf9f9f9));
+        text(L"Заряд устройств",name_.get(),RectF(20,15,width-110,44),primary);
+        if(!lastTime_.empty())text(lastTime_,small_.get(),RectF(width-108,18,width-20,42),secondary,true);
+        rt->PushAxisAlignedClip(RectF(0,50,width,footerTop),D2D1_ANTIALIAS_MODE_ALIASED);
         float rowTop=50.f-hoverOffset_;
         for(size_t i=0;i<cards_.size();++i){
             const float y=rowTop;
@@ -910,27 +978,31 @@ private:
             if(y+83+extra<50 || y>=rt->GetSize().height)continue;
             const auto& c=cards_[i];
             const auto level=c.last?c.last->percent:c.reading.percent;
-            const unsigned accent=!c.reading.percent?theme_.secondary:*c.reading.percent<=20?theme_.amber:flyoutAccent_;
-            band(10,y,width-10,y+83+extra,9,theme_.card);
-            text(profiles_[i].name,name_.get(),RectF(22,y+6,width-96,y+30),theme_.text);
-            text(CardValue(i),name_.get(),RectF(width-95,y+6,width-22,y+30),accent,true);
+            const unsigned accent=!c.reading.percent?secondary:*c.reading.percent<=20?theme_.amber:flyoutAccent_;
+            const auto& kind=profiles_[i].kind;
+            text(kind==L"mouse"?L"\uE962":kind==L"headset"?L"\uE95B":kind==L"gamepad"?L"\uE7FC":L"\uE772",
+                 flyoutIcons_.get(),RectF(20,y+8,48,y+39),primary);
+            text(profiles_[i].name,header_.get(),RectF(58,y+6,width-88,y+30),primary);
+            text(CardValue(i),header_.get(),RectF(width-82,y+6,width-20,y+30),primary,true);
             std::wstring status=int(i)==driverRow_ && firstSampleNotice_ && !c.reading.percent ?
                 firstSampleNotice_:c.reading.status;
             if(c.last && !c.reading.percent)status=L"Ранее · "+status;
             auto detail=profiles_[i].connection;
             if(!status.empty() && status!=detail)detail+=(detail.empty()?L"":L" · ")+status;
-            text(detail,small_.get(),RectF(22,y+30,width-20,y+50),theme_.secondary);
-            text(ChargeLine(c.charge,profiles_[i].protocol==L"airoha-ystech"),small_.get(),RectF(22,y+49,width-20,y+68),theme_.secondary);
+            text(detail,small_.get(),RectF(58,y+28,width-20,y+48),secondary);
+            text(ChargeLine(c.charge,profiles_[i].protocol==L"airoha-ystech"),small_.get(),RectF(58,y+47,width-20,y+66),secondary);
             if(c.charge.data.full)text((profiles_[i].protocol==L"airoha-ystech"?L"Оценка 100% · ":L"Полный заряд · ")+LocalStamp(c.charge.data.full),small_.get(),
-                                       RectF(22,y+67,width-20,y+85),theme_.secondary);
-            band(22,y+72+extra,width-22,y+76+extra,2,theme_.track);
-            const float end=level?22+(width-44)*(*level)/100.f:22;
-            if(end>22)band(22,y+72+extra,end,y+76+extra,2,accent);
+                                       RectF(58,y+65,width-20,y+85),secondary);
+            band(58,y+72+extra,width-20,y+75+extra,1.5f,dark?0x656565:0xc2c2c2);
+            const float end=level?58+(width-78)*(*level)/100.f:58;
+            if(end>58)band(58,y+72+extra,end,y+75+extra,1.5f,accent);
             if(ChargingIndicator(c.reading.power))
                 DrawCharging(rt,pen.get(),Point2F(width-94,y+17),
-                    RectF(22,y+72+extra,end>22?end:width-22,y+76+extra),flyoutAccent_,theme_.background==Light.background);
+                    RectF(58,y+72+extra,end>58?end:width-20,y+75+extra),flyoutAccent_,!dark);
         }
         rt->PopAxisAlignedClip();
+        band(0,footerTop,width,rt->GetSize().height,0,FooterColor());
+        band(0,footerTop,width,footerTop+1,0,dark?0x383838:0xe1e1e1);
         if(FAILED(rt->EndDraw()))hoverTarget_=nullptr;
     }
     void ShowFlyout() {
@@ -957,8 +1029,10 @@ private:
                 L"Заряд устройств",WS_POPUP|WS_CLIPCHILDREN,icon.left,icon.top,1,1,window_,nullptr,cls.hInstance,this);
             if(!hover_)return;
             auto button=[&](int id,const wchar_t* label){
-                return CreateWindowExW(0,L"BUTTON",label,WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,
+                HWND command=CreateWindowExW(0,L"BUTTON",label,WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,
                     0,0,1,1,hover_,reinterpret_cast<HMENU>(INT_PTR(id)),cls.hInstance,nullptr);
+                if(command)SetWindowSubclass(command,CommandButtonProc,1,0);
+                return command;
             };
             miniRefresh_=button(Refresh,L"Обновить");
             miniOpen_=button(Open,L"Открыть приложение");
@@ -967,7 +1041,7 @@ private:
             DwmSetWindowAttribute(hover_,DWMWA_WINDOW_CORNER_PREFERENCE,&corners,sizeof(corners));
         }
         const int dpi=GetDpiForWindow(hover_);
-        const int width=std::min<int>(work.right-work.left,MulDiv(388,dpi,96));
+        const int width=std::min<int>(work.right-work.left,MulDiv(408,dpi,96));
         int contentHeight=(flyoutOpen_?108:64)+int(cards_.size())*88;
         for(const auto& c:cards_)if(c.charge.data.full)contentHeight+=18;
         const int height=std::min<int>(work.bottom-work.top,MulDiv(contentHeight,dpi,96));
@@ -980,8 +1054,8 @@ private:
         SetWindowPos(hover_,HWND_TOPMOST,x,y,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
         auto px=[dpi](int value){return MulDiv(value,dpi,96);};
         UINT show=flyoutOpen_?SWP_SHOWWINDOW:SWP_HIDEWINDOW;
-        SetWindowPos(miniRefresh_,nullptr,px(18),height-px(44),px(98),px(31),SWP_NOACTIVATE|SWP_NOZORDER|show);
-        SetWindowPos(miniOpen_,nullptr,width-px(184),height-px(44),px(166),px(31),SWP_NOACTIVATE|SWP_NOZORDER|show);
+        SetWindowPos(miniRefresh_,nullptr,px(10),height-px(45),px(122),px(34),SWP_NOACTIVATE|SWP_NOZORDER|show);
+        SetWindowPos(miniOpen_,nullptr,width-px(204),height-px(45),px(194),px(34),SWP_NOACTIVATE|SWP_NOZORDER|show);
         SetWindowTextW(miniRefresh_,refreshing_?L"Проверка…":L"Обновить");
         EnableWindow(miniRefresh_,!refreshing_);
         InvalidateRect(hover_,nullptr,FALSE);
