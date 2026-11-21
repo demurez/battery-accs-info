@@ -46,7 +46,7 @@ std::optional<Reading> device(Bytes bytes) {
         if(f.number==9 && f.wire==0) level=f.value;
     }
     if(!model || !connected || level>6)return {};
-    if(level==6)return Reading{{},L"Заряжается"};
+    if(level==6)return Reading{{},L"Заряжается",false,PowerSource::Charging};
     constexpr int values[]{5,20,40,60,80,100};
     return Reading{values[level],L"По данным Space Station",true};
 }

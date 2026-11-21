@@ -14,10 +14,12 @@ struct Profile {
     std::vector<unsigned char> request;
 };
 
+enum class PowerSource { Unknown, Battery, External, Charging };
 struct Reading {
     std::optional<int> percent;
     std::wstring status;
     bool estimate{};
+    PowerSource power{PowerSource::Unknown};
 };
 
 struct ProfileHardware {

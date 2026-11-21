@@ -140,7 +140,8 @@ std::optional<Reading> StandardHid(HANDLE handle, const HidInterface& iface,
     });
     if (reply.empty()) return {};
     return Reading{reply[profile.batteryOffset], profile.powerOffset && reply[profile.powerOffset]
-                      ? L"Питание по USB" : L"Подключено"};
+                      ? L"Питание по USB" : L"Подключено",false, !profile.powerOffset?PowerSource::Unknown:
+                      reply[profile.powerOffset]?PowerSource::External:PowerSource::Battery};
 }
 
 Bytes RaceReply(const Bytes& raw, unsigned group, unsigned seq) {
@@ -325,7 +326,7 @@ std::optional<Reading> FilterBattery(bool trace) {
         result.Level > 5 || result.Charging > 1 || result.Reserved != 0)
         return Reading{{}, L"Несовместимая версия драйвера"};
     constexpr int levels[]{5, 20, 40, 60, 80, 100};
-    return Reading{levels[result.Level], result.Charging ? L"Заряжается" : L"По шкале Flydigi", true};
+    return Reading{levels[result.Level], result.Charging ? L"Заряжается" : L"По шкале Flydigi", true,result.Charging?PowerSource::Charging:PowerSource::Unknown};
 }
 
 Reading Gamepad(const Profile& profile, bool trace) {
@@ -342,7 +343,7 @@ Reading Gamepad(const Profile& profile, bool trace) {
                 const DWORD level=sample[2]&15;
                 if (current>=observed && current-observed<900000000ULL && level<=5 && sample[2]>>4<=1) {
                     constexpr int levels[]{5,20,40,60,80,100};
-                    return Reading{levels[level],sample[2]>>4 ? L"Заряжается" : L"По шкале Flydigi",true};
+                    return Reading{levels[level],sample[2]>>4 ? L"Заряжается" : L"По шкале Flydigi",true,sample[2]>>4?PowerSource::Charging:PowerSource::Unknown};
                 }
             }
         }

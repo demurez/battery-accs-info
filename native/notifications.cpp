@@ -66,17 +66,29 @@ void RegisterSummaryShortcut() {
                                       REG_SZ, guid, sizeof(guid)));
 }
 
-void PublishSummary(const std::vector<std::wstring>& rows) {
+void PublishSummary(const std::vector<SummaryDevice>& devices) {
     XmlDocument xml;
-    xml.LoadXml(L"<toast><visual><binding template='ToastGeneric'>"
-                L"<text>Заряд устройств</text><text hint-maxLines='4'/>"
+    xml.LoadXml(L"<toast><visual><binding template='ToastGeneric'><text hint-maxLines='2'/>"
                 L"</binding></visual><audio silent='true'/></toast>");
-    std::wstring lines;
-    for (auto& row : rows) {
-        if (!lines.empty()) lines += L'\n';
-        lines += row;
+    auto binding=xml.GetElementsByTagName(L"binding").Item(0);
+    std::wstring headline;
+    for(const auto& device:devices) {
+        const wchar_t* label=device.kind==L"mouse"?L"Мышь":device.kind==L"headset"?L"Наушники":
+                             device.kind==L"gamepad"?L"Геймпад":nullptr;
+        if(!headline.empty()) headline+=L" · ";
+        headline+=(label?std::wstring(label):device.name)+L" "+device.value;
+        if(device.stale) headline+=L"*";
+        auto bar=xml.CreateElement(L"progress");
+        bar.SetAttribute(L"title",device.name);
+        const auto level=device.percent.value_or(0);
+        const auto fraction=level>=100?std::wstring(L"1"):level<=0?std::wstring(L"0"):
+            (level<10?std::wstring(L"0.0"):std::wstring(L"0."))+std::to_wstring(level);
+        bar.SetAttribute(L"value",fraction);
+        bar.SetAttribute(L"valueStringOverride",device.value);
+        bar.SetAttribute(L"status",device.stale?L"* Последнее показание · "+device.status:device.status);
+        binding.AppendChild(bar);
     }
-    xml.GetElementsByTagName(L"text").Item(1).AppendChild(xml.CreateTextNode(lines));
+    xml.GetElementsByTagName(L"text").Item(0).AppendChild(xml.CreateTextNode(headline));
     ToastNotification toast(xml);
     toast.Tag(Tag);
     toast.Group(Group);

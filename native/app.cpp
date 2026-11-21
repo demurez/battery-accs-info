@@ -33,7 +33,7 @@ using D2D1::RoundedRect;
 
 constexpr wchar_t WindowClass[] = L"PeripheralCharge.Window";
 constexpr UINT BatteryReady = WM_APP + 1, TrayEvent = WM_APP + 2, SampleChanged = WM_APP + 3;
-constexpr UINT_PTR AnimationTimer = 1, PlugTimer = 2, DriverTimer = 4, FirstSampleTimer = 5, HistoryTimer = 6;
+constexpr UINT_PTR AnimationTimer = 1, PlugTimer = 2, DriverTimer = 4, FirstSampleTimer = 5, HistoryTimer = 6, ChargingTimer = 7;
 constexpr int Open = 101, Refresh = 102, Summary = 103, Quit = 104, Publish = 105, InstallDriver = 106;
 constexpr float Width = 536, Top = 119, Row = 116, Bottom = 54, Margin = 26;
 constexpr int InstallWidth = 154, InstallHeight = 32;
@@ -89,47 +89,80 @@ HICON BatteryIcon() {
     return icon;
 }
 
-struct FullCharge {
-    std::int64_t observed{}, atFull{};
+struct CycleData {
+    std::int64_t full{}, start{}, seconds{};
+    DWORD armed{}, wasFull{}, external{};
+    bool operator==(const CycleData&) const = default;
 };
-
-constexpr wchar_t ChargeKey[]=L"Software\\PeripheralCharge\\FullCharge";
-
+struct FullCharge {
+    CycleData data;
+    ULONGLONG previousTick{};
+};
+constexpr wchar_t CycleKey[]=L"Software\\PeripheralCharge\\BatteryCycle";
 FullCharge LoadCharge(const std::wstring& profile) {
-    FullCharge record{};
-    DWORD size=sizeof(record);
-    if(RegGetValueW(HKEY_CURRENT_USER,ChargeKey,profile.c_str(),RRF_RT_REG_BINARY,
-                    nullptr,&record,&size)!=ERROR_SUCCESS || size!=sizeof(record) ||
-       record.observed<0 || (record.atFull!=0 && record.atFull!=1)) return {};
-    return record;
+    FullCharge history{};
+    auto& d=history.data;
+    DWORD size=sizeof(d);
+    if(RegGetValueW(HKEY_CURRENT_USER,CycleKey,profile.c_str(),RRF_RT_REG_BINARY,nullptr,&d,&size)==ERROR_SUCCESS &&
+       size==sizeof(d) && d.start>=0 && d.full>=0 && d.seconds>=0 && d.armed<=1 && d.wasFull<=1 && d.external<=1)
+        return history;
+    d={};
+    std::int64_t old[2]{};
+    size=sizeof(old);
+    if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\PeripheralCharge\\FullCharge",profile.c_str(),
+                    RRF_RT_REG_BINARY,nullptr,old,&size)==ERROR_SUCCESS && size==sizeof(old) && old[0]>0){
+        d.full=old[0];
+        d.armed=d.wasFull=old[1]==1;
+    }
+    return history;
 }
 
-void TrackCharge(FullCharge& record,const std::wstring& profile,const Reading& reading) {
-    if(!reading.percent)return;
-    bool full=*reading.percent==100;
-    if(full==bool(record.atFull))return;
-    auto next=record;
-    if(full)next.observed=std::time(nullptr);
-    next.atFull=full;
-    if(RegSetKeyValueW(HKEY_CURRENT_USER,ChargeKey,profile.c_str(),REG_BINARY,&next,sizeof(next))==ERROR_SUCCESS)
-        record=next;
+void TrackCharge(FullCharge& history,const std::wstring& profile,const Reading& reading) {
+    auto d=history.data;
+    bool external=reading.power==PowerSource::External || reading.power==PowerSource::Charging;
+    const auto now=std::time(nullptr);
+    bool running=false;
+    if(external || reading.percent){
+        if(reading.percent){
+            const bool full=*reading.percent==100;
+            if(full && (!d.wasFull || (external && !d.external))){
+                d.full=now; d.armed=1; d.start=0; d.seconds=0;
+            }
+            d.wasFull=full;
+            if(!external && d.armed && (!full || reading.power==PowerSource::Battery)){
+                d.start=now; d.armed=0;
+            }
+            running=d.start && !external;
+        }
+        d.external=external;
+    }
+    const auto tick=GetTickCount64();
+    if(running && history.previousTick && tick-history.previousTick<=150000)
+        d.seconds+=(tick-history.previousTick)/1000;
+    history.previousTick=running?tick:0;
+    if(d==history.data)return;
+    history.data=d;
+    RegSetKeyValueW(HKEY_CURRENT_USER,CycleKey,profile.c_str(),REG_BINARY,&d,sizeof(d));
 }
 
-std::wstring ChargeLine(const FullCharge& record) {
-    if(!record.observed)return L"100% ещё не зафиксировано";
+std::wstring LocalStamp(std::int64_t stamp) {
     std::tm local{};
-    const std::time_t stamp=record.observed;
-    if(localtime_s(&local,&stamp))return L"Дата зарядки недоступна";
+    std::time_t t=stamp;
     wchar_t date[32]{};
-    std::wcsftime(date,std::size(date),L"%d.%m.%Y %H:%M",&local);
-    auto minutes=std::max<std::int64_t>(0,std::time(nullptr)-stamp)/60;
-    std::wstring age;
-    if(minutes>=1440)age=std::to_wstring(minutes/1440)+L" д "+std::to_wstring(minutes/60%24)+L" ч";
-    else if(minutes>=60)age=std::to_wstring(minutes/60)+L" ч "+std::to_wstring(minutes%60)+L" мин";
-    else if(minutes)age=std::to_wstring(minutes)+L" мин";
-    return L"100% · "+std::wstring(date)+L" · "+(age.empty()?L"только что":age+L" назад");
+    if(!localtime_s(&local,&t))std::wcsftime(date,std::size(date),L"%d.%m %H:%M",&local);
+    return date;
 }
-struct Card {
+std::wstring ChargeLine(const FullCharge& history) {
+    const auto& d=history.data;
+    if(!d.start)return d.armed?L"Полный заряд · ждём начала разряда":L"Ожидание полного цикла";
+    auto seconds=d.seconds;
+    const auto since=GetTickCount64()-history.previousTick;
+    if(history.previousTick && since<=150000)seconds+=since/1000;
+    const auto minutes=seconds/60;
+    std::wstring duration=minutes>=60?std::to_wstring(minutes/60)+L" ч ":L"";
+    duration+=std::to_wstring(minutes%60)+L" мин";
+    return L"На батарее "+duration+L" · с "+LocalStamp(d.start);
+}struct Card {
     Reading reading{{}, L"Ожидание данных"};
     std::optional<Reading> last;
     FullCharge charge{};
@@ -154,7 +187,7 @@ public:
 
         if (driverProcess_) CloseHandle(driverProcess_);
         if(hover_ && IsWindow(hover_))DestroyWindow(hover_);
-        if(hoverFont_)DeleteObject(hoverFont_);
+
         if (icon_) DestroyIcon(icon_);
     }
 
@@ -240,12 +273,15 @@ public:
             return 0;
         case WM_DRAWITEM:
             if (w == InstallDriver) {
-                DrawDriverButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(l));
+                DrawActionButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(l));
                 return TRUE;
             }
             break;
         case WM_TIMER:
-            if (w == HistoryTimer) {
+            if(w==ChargingTimer){
+                if(IsWindowVisible(window_) && !IsIconic(window_))InvalidateRect(window_,nullptr,FALSE);
+                if(hover_ && IsWindowVisible(hover_))InvalidateRect(hover_,nullptr,FALSE);
+            } else if (w == HistoryTimer) {
                 if(IsWindowVisible(window_)) InvalidateRect(window_,nullptr,FALSE);
                 if(hover_ && IsWindowVisible(hover_)) ShowHover();
             } else if (w == AnimationTimer) {
@@ -291,10 +327,10 @@ public:
             return 0;
         }
         case TrayEvent:
-            if(LOWORD(l)==NIN_POPUPOPEN){ ShowHover(); return 0; }
-            if(LOWORD(l)==NIN_POPUPCLOSE){ if(hover_)ShowWindow(hover_,SW_HIDE); UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE); return 0; }
+            if(LOWORD(l)==NIN_POPUPOPEN){ if(!flyoutOpen_)ShowHover(); return 0; }
+            if(LOWORD(l)==NIN_POPUPCLOSE){ if(hover_ && !flyoutOpen_)ShowWindow(hover_,SW_HIDE); UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE); return 0; }
             if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT || LOWORD(l) == WM_LBUTTONUP)
-                Reveal();
+                ToggleFlyout(LOWORD(l)==NIN_KEYSELECT);
             else if (LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_RBUTTONUP) TrayMenu();
             return 0;
         case WM_CLOSE:
@@ -332,7 +368,7 @@ private:
     bool driverOffered_{}, driverReboot_{};
 
     const wchar_t* driverNotice_{};
-    std::vector<std::wstring> lastSummary_;
+    std::vector<SummaryDevice> lastSummary_;
     std::wstring lastTime_;
     Theme theme_ = Dark;
     int scroll_{};
@@ -411,6 +447,7 @@ private:
     void Request(bool enqueue = false) {
         if (refreshing_ && !enqueue) return;
         refreshing_ = true;
+        if(flyoutOpen_ && miniRefresh_){SetWindowTextW(miniRefresh_,L"Проверка…"); EnableWindow(miniRefresh_,FALSE);}
         {
             std::lock_guard lock(mutex_);
             requested_ = true;
@@ -425,7 +462,14 @@ private:
         for (size_t i = 0; i < cards_.size(); ++i) {
             auto& card = cards_[i];
             card.from += (card.to - card.from) * previous;
-            card.reading = std::move(values[i]);
+            auto next=std::move(values[i]);
+            if(next.power==PowerSource::External && next.percent && *next.percent<100 &&
+               card.reading.percent && (card.reading.power==PowerSource::External || card.reading.power==PowerSource::Charging) &&
+               (*next.percent>*card.reading.percent || (card.reading.power==PowerSource::Charging && *next.percent==*card.reading.percent))){
+                next.power=PowerSource::Charging;
+                next.status=L"Заряжается · USB";
+            }
+            card.reading=std::move(next);
             TrackCharge(card.charge,profiles_[i].file,card.reading);
             if (int(i)==driverRow_ && card.reading.percent && firstSampleNotice_) {
                 firstSampleNotice_=nullptr;
@@ -569,7 +613,7 @@ private:
         Request(true);
     }
 
-    void DrawDriverButton(const DRAWITEMSTRUCT& item) const {
+    void DrawActionButton(const DRAWITEMSTRUCT& item) const {
         auto rgb = [](unsigned color) {
             return RGB((color >> 16) & 255, (color >> 8) & 255, color & 255);
         };
@@ -593,7 +637,7 @@ private:
         SetBkMode(item.hDC, TRANSPARENT);
         SetTextColor(item.hDC, rgb(disabled ? theme_.secondary : theme_.accent));
         wchar_t label[64]{};
-        GetWindowTextW(driverButton_, label, int(std::size(label)));
+        GetWindowTextW(item.hwndItem, label, int(std::size(label)));
         RECT text = rect;
         DrawTextW(item.hDC, label, -1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         if (font) { SelectObject(item.hDC, previousFont); DeleteObject(font); }
@@ -612,16 +656,13 @@ private:
     void SendSummary(bool force) {
         if (!force && lastSummary_.empty() &&
             std::ranges::none_of(cards_, [](const Card& card) { return card.last.has_value(); })) return;
-        std::vector<std::wstring> rows;
-        auto written = std::min<size_t>(3, profiles_.size());
-        for (size_t i = 0; i < written; ++i) {
-            auto& card = cards_[i];
-            auto value = CardValue(i);
-            if (card.last && !card.reading.percent) value += L" ранее";
-            rows.push_back(profiles_[i].name + L"  " + value);
+        std::vector<SummaryDevice> rows;
+        for(size_t i=0;i<cards_.size();++i){
+            const auto& card=cards_[i];
+            rows.push_back({profiles_[i].name, profiles_[i].kind, CardValue(i), card.reading.status,
+                            card.last?card.last->percent:card.reading.percent,
+                            card.last.has_value() && !card.reading.percent});
         }
-        if (profiles_.size() > written)
-            rows.push_back(L"Ещё устройств: " + std::to_wstring(profiles_.size() - written));
         if (!force && rows == lastSummary_) return;
         try {
             if (!registered_) { RegisterSummaryShortcut(); registered_ = true; }
@@ -670,17 +711,164 @@ private:
         } else if (!Shell_NotifyIconW(NIM_MODIFY, &tray)) AddTray();
     }
 
+    bool chargeMotion_{};
+    float ChargeRadius() const {
+        return chargeMotion_?3.5f+0.9f*std::sin(float(GetTickCount64()%1800)*0.00349066f):3.5f;
+    }
     HWND hover_{};
-    HFONT hoverFont_{};
-    int hoverDpi_{};
+    winrt::com_ptr<ID2D1HwndRenderTarget> hoverTarget_;
+    int hoverOffset_{}, hoverLimit_{};
+    HWND miniRefresh_{}, miniOpen_{};
+    bool flyoutOpen_{};
+    ULONGLONG lastTrayClick_{}, lastFlyoutDismiss_{};
+
+    void CloseFlyout() {
+        flyoutOpen_=false;
+        if(hover_)ShowWindow(hover_,SW_HIDE);
+        UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE);
+    }
+
+    void ToggleFlyout(bool keyboard) {
+        auto now=GetTickCount64();
+        if(now-lastTrayClick_<150)return;
+        lastTrayClick_=now;
+        if(flyoutOpen_){CloseFlyout();return;}
+        if(now-lastFlyoutDismiss_<200)return;
+        flyoutOpen_=true;
+        ShowHover();
+        if(!hover_){flyoutOpen_=false;return;}
+        SetForegroundWindow(hover_);
+        SetFocus(keyboard?miniRefresh_:hover_);
+    }
+
+    public:
+    bool HandleMiniKey(const MSG& message) {
+        if(!flyoutOpen_ || (message.hwnd!=hover_ && !IsChild(hover_,message.hwnd)))return false;
+        if(message.message==WM_KEYDOWN && message.wParam==VK_ESCAPE){CloseFlyout();return true;}
+        if(message.message==WM_KEYDOWN && message.wParam==VK_TAB){
+            SetFocus(GetFocus()==miniRefresh_?miniOpen_:miniRefresh_);
+            return true;
+        }
+        if(message.message==WM_KEYDOWN && message.wParam==VK_RETURN &&
+           (message.hwnd==miniRefresh_ || message.hwnd==miniOpen_)){
+            SendMessageW(message.hwnd,BM_CLICK,0,0);
+            return true;
+        }
+        return false;
+    }
+    private:
 
     void UpdateHistoryTimer(bool mainVisible) {
-        const bool visible=mainVisible || (hover_ && IsWindowVisible(hover_));
-        if(visible && std::ranges::any_of(cards_,[](const Card& card){return card.charge.observed!=0;}))
+        const bool visible=(mainVisible && !IsIconic(window_)) || (hover_ && IsWindowVisible(hover_));
+        BOOL motion=TRUE;
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&motion,0);
+        if(visible && motion && std::ranges::any_of(cards_,[](const Card& c){return c.reading.power==PowerSource::Charging;}))
+            SetTimer(window_,ChargingTimer,100,nullptr);
+        else KillTimer(window_,ChargingTimer);
+        chargeMotion_=motion!=FALSE;
+        if(visible && std::ranges::any_of(cards_,[](const Card& card){return card.charge.previousTick!=0;}))
             SetTimer(window_,HistoryTimer,60000,nullptr);
         else KillTimer(window_,HistoryTimer);
     }
 
+    static LRESULT CALLBACK HoverProcedure(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
+        if(msg==WM_NCCREATE){
+            auto create=reinterpret_cast<CREATESTRUCTW*>(l);
+            SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        }
+        auto self=reinterpret_cast<Monitor*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
+        if(self && msg==WM_PAINT){
+            PAINTSTRUCT ps{};
+            BeginPaint(hwnd,&ps);
+            try { self->PaintHover(hwnd); } catch(const winrt::hresult_error&){ self->hoverTarget_=nullptr; }
+            EndPaint(hwnd,&ps);
+            return 0;
+        }
+        if(msg==WM_ERASEBKGND)return 1;
+        if(self && msg==WM_ACTIVATE && LOWORD(w)==WA_INACTIVE && self->flyoutOpen_){
+            self->lastFlyoutDismiss_=GetTickCount64();
+            self->CloseFlyout();
+            return 0;
+        }
+        if(self && msg==WM_COMMAND && HIWORD(w)==BN_CLICKED){
+            if(LOWORD(w)==Refresh)self->Request();
+            if(LOWORD(w)==Open){self->CloseFlyout();self->Reveal();}
+            return 0;
+        }
+        if(self && msg==WM_DRAWITEM){
+            self->DrawActionButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(l));
+            return TRUE;
+        }
+        if(msg==WM_MOUSEACTIVATE)return self && self->flyoutOpen_?MA_ACTIVATE:MA_NOACTIVATE;
+        if(self && msg==WM_MOUSEWHEEL){
+            self->hoverOffset_=std::clamp(self->hoverOffset_-GET_WHEEL_DELTA_WPARAM(w)/WHEEL_DELTA*44,0,self->hoverLimit_);
+            InvalidateRect(hwnd,nullptr,FALSE);
+            return 0;
+        }
+        return DefWindowProcW(hwnd,msg,w,l);
+    }
+
+    void PaintHover(HWND hwnd){
+        EnsureFactories();
+        RECT rc{}; GetClientRect(hwnd,&rc);
+        const auto pixels=D2D1::SizeU(rc.right,rc.bottom);
+        const float dpi=float(GetDpiForWindow(hwnd));
+        if(!hoverTarget_)
+            winrt::check_hresult(direct2d_->CreateHwndRenderTarget(
+                D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(),dpi,dpi),
+                D2D1::HwndRenderTargetProperties(hwnd,pixels),hoverTarget_.put()));
+        auto rt=hoverTarget_.get();
+        if(rt->GetPixelSize().width!=pixels.width || rt->GetPixelSize().height!=pixels.height)
+            winrt::check_hresult(rt->Resize(pixels));
+        rt->SetDpi(dpi,dpi);
+        winrt::com_ptr<ID2D1SolidColorBrush> pen;
+        winrt::check_hresult(rt->CreateSolidColorBrush(ColorF(theme_.text),pen.put()));
+        const float width=rt->GetSize().width;
+        auto text=[&](const std::wstring& value,IDWriteTextFormat* font,D2D1_RECT_F bounds,unsigned color,bool right=false){
+            pen->SetColor(ColorF(color));
+            font->SetTextAlignment(right?DWRITE_TEXT_ALIGNMENT_TRAILING:DWRITE_TEXT_ALIGNMENT_LEADING);
+            rt->DrawText(value.c_str(),UINT32(value.size()),font,bounds,pen.get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        };
+        auto band=[&](float left,float top,float right,float bottom,float radius,unsigned color){
+            pen->SetColor(ColorF(color));
+            rt->FillRoundedRectangle(RoundedRect(RectF(left,top,right,bottom),radius,radius),pen.get());
+        };
+        rt->BeginDraw();
+        rt->Clear(ColorF(theme_.background));
+        text(L"Заряд устройств",name_.get(),RectF(18,14,width-108,44),theme_.text);
+        if(!lastTime_.empty())text(L"На "+lastTime_,small_.get(),RectF(width-108,17,width-18,42),theme_.secondary,true);
+        rt->PushAxisAlignedClip(RectF(0,50,width,rt->GetSize().height-(flyoutOpen_?50.f:6.f)),D2D1_ANTIALIAS_MODE_ALIASED);
+        float rowTop=50.f-hoverOffset_;
+        for(size_t i=0;i<cards_.size();++i){
+            const float y=rowTop;
+            const float extra=cards_[i].charge.data.full?18.f:0.f;
+            rowTop+=88.f+extra;
+            if(y+83+extra<50 || y>=rt->GetSize().height)continue;
+            const auto& c=cards_[i];
+            const auto level=c.last?c.last->percent:c.reading.percent;
+            const unsigned accent=!c.reading.percent?theme_.secondary:*c.reading.percent<=20?theme_.amber:theme_.accent;
+            band(10,y,width-10,y+83+extra,9,theme_.card);
+            text(profiles_[i].name,name_.get(),RectF(22,y+6,width-96,y+30),theme_.text);
+            if(c.reading.power==PowerSource::Charging){
+                auto r=ChargeRadius();pen->SetColor(ColorF(theme_.accent));
+                rt->FillEllipse(D2D1::Ellipse(Point2F(width-96,y+16),r,r),pen.get());
+            }
+            text(CardValue(i),name_.get(),RectF(width-95,y+6,width-22,y+30),accent,true);
+            std::wstring status=int(i)==driverRow_ && firstSampleNotice_ && !c.reading.percent ?
+                firstSampleNotice_:c.reading.status;
+            if(c.last && !c.reading.percent)status=L"Ранее · "+status;
+            auto detail=profiles_[i].connection;
+            if(!status.empty() && status!=detail)detail+=(detail.empty()?L"":L" · ")+status;
+            text(detail,small_.get(),RectF(22,y+30,width-20,y+50),theme_.secondary);
+            text(ChargeLine(c.charge),small_.get(),RectF(22,y+49,width-20,y+68),theme_.secondary);
+            if(c.charge.data.full)text(L"Полный заряд · "+LocalStamp(c.charge.data.full),small_.get(),
+                                       RectF(22,y+67,width-20,y+85),theme_.secondary);
+            band(22,y+72+extra,width-22,y+76+extra,2,theme_.track);
+            if(level && *level>0)band(22,y+72+extra,22+(width-44)*(*level)/100.f,y+76+extra,2,accent);
+        }
+        rt->PopAxisAlignedClip();
+        if(FAILED(rt->EndDraw()))hoverTarget_=nullptr;
+    }
     void ShowHover() {
         auto tray=TrayData();
         NOTIFYICONIDENTIFIER id{sizeof(id)};
@@ -694,48 +882,46 @@ private:
         MONITORINFO monitor{sizeof(monitor)};
         GetMonitorInfoW(MonitorFromRect(&icon,MONITOR_DEFAULTTONEAREST),&monitor);
         const auto work=monitor.rcWork;
-        if(!hover_) hover_=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,
-            L"EDIT",nullptr,WS_POPUP|WS_BORDER|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|WS_VSCROLL,
-            icon.left,icon.top,1,1,window_,nullptr,GetModuleHandleW(nullptr),nullptr);
-        if(!hover_)return;
-        int dpi=GetDpiForWindow(hover_);
-        if(dpi!=hoverDpi_){
-            HFONT font=CreateFontW(-MulDiv(14,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-            if(font){SendMessageW(hover_,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
-                if(hoverFont_)DeleteObject(hoverFont_); hoverFont_=font;hoverDpi_=dpi;}
+        if(!hover_){
+            WNDCLASSW cls{};
+            cls.lpfnWndProc=HoverProcedure;
+            cls.hInstance=GetModuleHandleW(nullptr);
+            cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+            cls.lpszClassName=L"PeripheralCharge.TrayDetails";
+            if(!RegisterClassW(&cls) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
+            hover_=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,cls.lpszClassName,
+                L"Заряд устройств",WS_POPUP|WS_CLIPCHILDREN,icon.left,icon.top,1,1,window_,nullptr,cls.hInstance,this);
+            if(!hover_)return;
+            auto button=[&](int id,const wchar_t* label){
+                return CreateWindowExW(0,L"BUTTON",label,WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,
+                    0,0,1,1,hover_,reinterpret_cast<HMENU>(INT_PTR(id)),cls.hInstance,nullptr);
+            };
+            miniRefresh_=button(Refresh,L"Обновить");
+            miniOpen_=button(Open,L"Открыть приложение");
+            BOOL dark=DarkMode();
+            DwmSetWindowAttribute(hover_,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark));
+            DWM_WINDOW_CORNER_PREFERENCE corners=DWMWCP_ROUND;
+            DwmSetWindowAttribute(hover_,DWMWA_WINDOW_CORNER_PREFERENCE,&corners,sizeof(corners));
         }
-        std::wstring info;
-        for(size_t i=0;i<cards_.size();++i){
-            auto& card=cards_[i];
-            if(i)info+=L"\r\n\r\n";
-            info+=profiles_[i].name+L"   "+CardValue(i);
-            if(card.last && !card.reading.percent)info+=L" (ранее)";
-            info+=L"\r\n"+profiles_[i].connection;
-            auto status=(int(i)==driverRow_ && firstSampleNotice_ && !card.reading.percent)?
-                std::wstring(firstSampleNotice_):card.reading.status;
-            if(!status.empty() && status!=profiles_[i].connection)info+=L" · "+status;
-            info+=L"\r\n"+ChargeLine(card.charge);
-        }
-        if(!lastTime_.empty())info+=L"\r\n\r\nПроверено в "+lastTime_;
-        const int width=std::min<int>(work.right-work.left,MulDiv(420,dpi,96));
-        const int pad=MulDiv(10,dpi,96);
-        HDC dc=GetDC(hover_);
-        auto old=SelectObject(dc,hoverFont_);
-        RECT text{0,0,width-2*pad-GetSystemMetrics(SM_CXVSCROLL)-4,0};
-        DrawTextW(dc,info.c_str(),-1,&text,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX|DT_EDITCONTROL);
-        SelectObject(dc,old);ReleaseDC(hover_,dc);
-        const int height=std::min<int>(work.bottom-work.top,text.bottom+2*pad+6);
+        const int dpi=GetDpiForWindow(hover_);
+        const int width=std::min<int>(work.right-work.left,MulDiv(388,dpi,96));
+        int contentHeight=(flyoutOpen_?108:64)+int(cards_.size())*88;
+        for(const auto& c:cards_)if(c.charge.data.full)contentHeight+=18;
+        const int height=std::min<int>(work.bottom-work.top,MulDiv(contentHeight,dpi,96));
+        hoverLimit_=std::max(0,contentHeight-MulDiv(height,96,dpi));
+        hoverOffset_=IsWindowVisible(hover_)?std::min(hoverOffset_,hoverLimit_):0;
         int x=std::clamp<int>((icon.left+icon.right-width)/2,work.left,work.right-width);
-        int y=icon.top-height-4;
-        if(y<work.top)y=icon.bottom+4;
+        int y=icon.top-height-6;
+        if(y<work.top)y=icon.bottom+6;
         y=std::clamp<int>(y,work.top,work.bottom-height);
-        SetWindowPos(hover_,HWND_TOPMOST,x,y,width,height,SWP_NOACTIVATE);
-        RECT inner{pad,pad,width-pad-GetSystemMetrics(SM_CXVSCROLL),height-pad};
-        SendMessageW(hover_,EM_SETRECT,0,reinterpret_cast<LPARAM>(&inner));
-        SetWindowTextW(hover_,info.c_str());
-        ShowScrollBar(hover_,SB_VERT,text.bottom>height-2*pad);
-        ShowWindow(hover_,SW_SHOWNOACTIVATE);
+        SetWindowPos(hover_,HWND_TOPMOST,x,y,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        auto px=[dpi](int value){return MulDiv(value,dpi,96);};
+        UINT show=flyoutOpen_?SWP_SHOWWINDOW:SWP_HIDEWINDOW;
+        SetWindowPos(miniRefresh_,nullptr,px(18),height-px(44),px(98),px(31),SWP_NOACTIVATE|SWP_NOZORDER|show);
+        SetWindowPos(miniOpen_,nullptr,width-px(184),height-px(44),px(166),px(31),SWP_NOACTIVATE|SWP_NOZORDER|show);
+        SetWindowTextW(miniRefresh_,refreshing_?L"Проверка…":L"Обновить");
+        EnableWindow(miniRefresh_,!refreshing_);
+        InvalidateRect(hover_,nullptr,FALSE);
         UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE);
     }
     void AddTray() { UpdateTray(true); }
@@ -747,6 +933,7 @@ private:
     }
 
     void TrayMenu() {
+        if(flyoutOpen_)CloseFlyout();
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
         AppendMenuW(menu, MF_STRING, Open, L"Открыть");
@@ -786,6 +973,7 @@ private:
         BOOL dark = DarkMode();
         theme_ = dark ? Dark : Light;
         DwmSetWindowAttribute(window_, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+        if(hover_){ DwmSetWindowAttribute(hover_,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark)); InvalidateRect(hover_,nullptr,FALSE); }
         if (driverButton_) InvalidateRect(driverButton_, nullptr, TRUE);
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -800,7 +988,7 @@ private:
             out->SetTrimming(&trim, ellipsis.get());
     }
 
-    void EnsureRender() {
+    void EnsureFactories() {
         if (!direct2d_) winrt::check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, direct2d_.put()));
         if (!directWrite_) {
             winrt::check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -811,6 +999,9 @@ private:
             Font(small_, 13, DWRITE_FONT_WEIGHT_NORMAL);
             Font(percent_, 25, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         }
+    }
+    void EnsureRender() {
+        EnsureFactories();
         if (!render_) {
             RECT rect{};
             GetClientRect(window_, &rect);
@@ -910,6 +1101,11 @@ private:
             const bool current = card.reading.percent.has_value();
             const auto chargeColor = !current ? theme_.secondary :
                                      *card.reading.percent <= 20 ? theme_.amber : theme_.accent;
+            if(!offer && card.reading.power==PowerSource::Charging){
+                brush_->SetColor(ColorF(theme_.accent));
+                const auto r=ChargeRadius();
+                render_->FillEllipse(D2D1::Ellipse(Point2F(right-83,y+23),r,r),brush_.get());
+            }
             if (!offer)
                 Text(CardValue(index), percent_.get(), RectF(right - 88, y + 7, right, y + 38), chargeColor, true);
             Round(RectF(left, y + 88, right, y + 93), 2.5f, theme_.track);
@@ -977,6 +1173,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
         monitor.Start(tray);
         MSG message{};
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if(monitor.HandleMiniKey(message))continue;
             if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && IsDialogMessageW(window, &message))
                 continue;
             TranslateMessage(&message);
