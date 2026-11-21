@@ -26,6 +26,7 @@
 
 #include "../driver/direwolf_interface.h"
 #include "driver_install.hpp"
+#include "flydigi_station.hpp"
 
 using namespace winrt::Windows::Data::Json;
 using winrt::Windows::Gaming::Input::RawGameController;
@@ -329,6 +330,22 @@ std::optional<Reading> FilterBattery(bool trace) {
 
 Reading Gamepad(const Profile& profile, bool trace) {
     if (_wcsicmp(profile.usbSerial.c_str(), L"Flydigi_Direwolf_4") == 0) {
+        if (DirewolfPresent()) {
+            if (auto station = FlydigiStationBattery()) return *station;
+            DWORD sample[3]{}, size=sizeof(sample);
+            if (RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Battery Monitor\\Flydigi",L"Sample",
+                             RRF_RT_REG_BINARY,nullptr,sample,&size)==ERROR_SUCCESS && size==sizeof(sample)) {
+                FILETIME now{};
+                GetSystemTimeAsFileTime(&now);
+                const auto current=(static_cast<ULONGLONG>(now.dwHighDateTime)<<32)|now.dwLowDateTime;
+                const auto observed=(static_cast<ULONGLONG>(sample[1])<<32)|sample[0];
+                const DWORD level=sample[2]&15;
+                if (current>=observed && current-observed<900000000ULL && level<=5 && sample[2]>>4<=1) {
+                    constexpr int levels[]{5,20,40,60,80,100};
+                    return Reading{levels[level],sample[2]>>4 ? L"Заряжается" : L"По шкале Flydigi",true};
+                }
+            }
+        }
         if (auto reading = FilterBattery(trace)) return *reading;
     }
     auto xusb = XusbBattery(profile, trace);

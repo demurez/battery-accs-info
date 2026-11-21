@@ -8,6 +8,8 @@ inline constexpr int DriverSetupError = 4;
 
 bool DirewolfPresent();
 bool DirewolfDriverPresent();
-bool DirewolfPackagePublished();
+
 HANDLE StartDirewolfDriverInstall(HWND owner, DWORD& error);
 int InstallDirewolfDriver();
+bool VendorFilterInstalled();
+bool VendorSamplerInstalled();

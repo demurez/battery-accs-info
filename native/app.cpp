@@ -31,7 +31,7 @@ using D2D1::RectF;
 using D2D1::RoundedRect;
 
 constexpr wchar_t WindowClass[] = L"PeripheralCharge.Window";
-constexpr UINT BatteryReady = WM_APP + 1, TrayEvent = WM_APP + 2, DriverChecked = WM_APP + 3;
+constexpr UINT BatteryReady = WM_APP + 1, TrayEvent = WM_APP + 2;
 constexpr UINT_PTR AnimationTimer = 1, PlugTimer = 2, DriverTimer = 4;
 constexpr int Open = 101, Refresh = 102, Summary = 103, Quit = 104, Publish = 105, InstallDriver = 106;
 constexpr float Width = 536, Top = 119, Row = 94, Bottom = 54, Margin = 26;
@@ -106,7 +106,7 @@ public:
         }
         wake_.notify_one();
         if (worker_.joinable()) worker_.join();
-        if (driverCheck_.joinable()) driverCheck_.join();
+
         if (driverProcess_) CloseHandle(driverProcess_);
         if (icon_) DestroyIcon(icon_);
     }
@@ -228,15 +228,6 @@ public:
             if (!result.empty()) Display(std::move(result));
             return 0;
         }
-        case DriverChecked:
-            if (driverCheck_.joinable()) driverCheck_.join();
-            driverChecking_ = false;
-            if (w && DirewolfPresent() && !DirewolfDriverPresent()) LaunchDriverInstall();
-            else {
-                driverNotice_ = w ? nullptr : L"Пакет пока недоступен";
-                UpdateDriverOffer();
-            }
-            return 0;
         case TrayEvent:
             if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT || LOWORD(l) == WM_LBUTTONUP)
                 Reveal();
@@ -274,8 +265,8 @@ private:
     HWND driverButton_{};
     HANDLE driverProcess_{};
     int driverRow_{-1};
-    bool driverOffered_{}, driverChecking_{}, driverReboot_{};
-    std::thread driverCheck_;
+    bool driverOffered_{}, driverReboot_{};
+
     const wchar_t* driverNotice_{};
     std::vector<std::wstring> lastSummary_;
     std::wstring lastTime_;
@@ -424,31 +415,28 @@ private:
         if (!driverButton_) return;
         const bool matched = driverRow_ >= 0 && DirewolfPresent();
         driverOffered_ = matched && !DirewolfDriverPresent() &&
-                         !cards_[driverRow_].reading.percent.has_value();
-        if (!matched && !driverProcess_ && !driverChecking_) {
+                         (VendorFilterInstalled() ? !VendorSamplerInstalled() && cards_[driverRow_].reading.status != L"По данным Space Station" : !cards_[driverRow_].reading.percent.has_value());
+        if (!matched && !driverProcess_) {
             driverNotice_ = nullptr;
             driverReboot_ = false;
         }
-        EnableWindow(driverButton_, driverOffered_ && !driverChecking_ && !driverProcess_ && !driverReboot_);
-        SetWindowTextW(driverButton_, driverChecking_ ? L"Проверяю пакет…" : driverProcess_ ? L"Установка…" :
-                       driverReboot_ ? L"Перезапустите ПК" : L"Установить драйвер");
+        EnableWindow(driverButton_, driverOffered_ && !driverProcess_ && !driverReboot_);
+        SetWindowTextW(driverButton_, driverProcess_ ? L"Установка…" :
+                       driverReboot_ ? L"Перезапустите ПК" : VendorFilterInstalled() ? L"Включить автоопрос" : L"Установить драйвер");
         PositionDriverButton();
         InvalidateRect(window_, nullptr, FALSE);
     }
 
     void BeginDriverInstall() {
         UpdateDriverOffer();
-        if (!driverOffered_ || driverChecking_ || driverProcess_ || driverReboot_) return;
+        if (!driverOffered_ || driverProcess_ || driverReboot_) return;
         driverNotice_ = nullptr;
-        driverChecking_ = true;
-        driverCheck_ = std::thread([this] {
-            bool found = false;
-            try { found = DirewolfPackagePublished(); } catch (...) {}
-            PostMessageW(window_, DriverChecked, found, 0);
-        });
-        UpdateDriverOffer();
+        const wchar_t* text=VendorFilterInstalled()
+            ? L"Включить опрос заряда раз в минуту с помощью задачи Windows от имени SYSTEM?"
+            : L"Скачать подписанный фильтр Flydigi из репозитория Battery Monitor, зарегистрировать его и включить опрос заряда раз в минуту с помощью задачи Windows от имени SYSTEM?";
+        if(MessageBoxW(window_,text,L"Заряд Direwolf 4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)
+            LaunchDriverInstall();
     }
-
     void LaunchDriverInstall() {
         DWORD error{};
         driverProcess_ = StartDirewolfDriverInstall(window_, error);
@@ -737,7 +725,9 @@ private:
             const float detailRight = offer ? right - InstallWidth - 12 : right;
             Text(profile.name, name_.get(), RectF(left, y + 11, offer ? detailRight : right - 85, y + 37), theme_.text);
             std::wstring detail;
-            if (offer) detail = driverNotice_ ? driverNotice_ : L"Драйвер для чтения заряда";
+            if (offer && driverNotice_) detail=driverNotice_;
+            else if (offer && card.reading.percent) detail=CardValue(index)+L" · "+card.reading.status;
+            else if (offer) detail=VendorFilterInstalled()?L"Доступен автоопрос":L"Драйвер для чтения заряда";
             else if (card.last && !card.reading.percent) detail = L"Последнее значение · " + card.reading.status;
             else if (card.reading.status == L"Подключено") detail = profile.connection;
             else detail = card.reading.status;

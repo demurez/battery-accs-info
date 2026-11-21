@@ -7,6 +7,14 @@
 #include <sddl.h>
 #include <setupapi.h>
 #include <shellapi.h>
+#include <bcrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <array>
+
+#include <cstdio>
+#pragma comment(lib,"bcrypt.lib")
+#pragma comment(lib,"wintrust.lib")
 
 #include <filesystem>
 #include <string>
@@ -18,12 +26,6 @@
 
 namespace {
 constexpr GUID FilterInterface = DIREWOLF_INTERFACE_GUID;
-
-constexpr const wchar_t* Package[]{
-    L"PeripheralChargeDirewolf.inf",
-    L"PeripheralChargeDirewolf.sys",
-    L"PeripheralChargeDirewolf.cat",
-};
 
 bool IsAdministrator() {
     SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
@@ -38,13 +40,12 @@ bool IsAdministrator() {
 
 struct StagingDirectory {
     std::filesystem::path path;
-
     ~StagingDirectory() {
-        if (path.empty()) return;
-        for (auto entry : Package) DeleteFileW((path / entry).c_str());
-        RemoveDirectoryW(path.c_str());
+        if (!path.empty()) {
+            DeleteFileW((path / L"Xbox360Filter64.sys").c_str());
+            RemoveDirectoryW(path.c_str());
+        }
     }
-
     bool Create(const std::filesystem::path& system) {
         GUID id{};
         wchar_t name[39]{};
@@ -60,20 +61,7 @@ struct StagingDirectory {
         return created != FALSE;
     }
 
-    bool Download() const {
-        for (auto entry : Package) {
-            auto bytes = ReadRepositoryFile(std::wstring(L"driver-package/") + entry, 2 * 1024 * 1024);
-            if (!bytes || bytes->empty()) return false;
-            HANDLE output = CreateFileW((path / entry).c_str(), GENERIC_WRITE,
-                0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (output == INVALID_HANDLE_VALUE) return false;
-            DWORD written{};
-            const BOOL ok = WriteFile(output, bytes->data(), DWORD(bytes->size()), &written, nullptr);
-            CloseHandle(output);
-            if (!ok || written != bytes->size()) return false;
-        }
-        return true;
-    }
+
 };
 }
 
@@ -101,12 +89,143 @@ bool DirewolfDriverPresent() {
                == CR_SUCCESS && chars > 1;
 }
 
-bool DirewolfPackagePublished() {
-    auto marker = ReadRepositoryFile(L"driver-package/version.txt", 64);
-    return marker && (*marker == "direwolf-package-v1" || *marker == "direwolf-package-v1\n" ||
-                      *marker == "direwolf-package-v1\r\n");
+namespace {
+std::filesystem::path SystemFolder() {
+    wchar_t system[MAX_PATH]{};
+    if (!GetSystemDirectoryW(system, MAX_PATH)) return {};
+    return system;
+}
+constexpr wchar_t ReaderName[]=L"BatteryMonitorFlydigiSample.exe";
+constexpr wchar_t TaskName[]=L"Battery Monitor - Flydigi charge";
+
+DWORD TaskCommand(const std::wstring& arguments) {
+    auto exe=SystemFolder()/L"schtasks.exe";
+    auto command=L"\""+exe.wstring()+L"\" "+arguments;
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if(!CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,
+                       nullptr,nullptr,&si,&pi))return GetLastError();
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess,INFINITE);
+    DWORD code=1;
+    GetExitCodeProcess(pi.hProcess,&code);
+    CloseHandle(pi.hProcess);
+    return code;
 }
 
+constexpr wchar_t VendorFile[]=L"Xbox360Filter64.sys";
+constexpr wchar_t VendorPath[]=L"driver-package/flydigi-4.2.3.1/Xbox360Filter64.sys";
+bool ApprovedBytes(const std::string& bytes) {
+    std::array<UCHAR,32> digest{};
+    if(BCryptHash(BCRYPT_SHA256_ALG_HANDLE,nullptr,0,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(bytes.data())),static_cast<ULONG>(bytes.size()),
+            digest.data(),static_cast<ULONG>(digest.size()))<0)return false;
+    char hex[65]{};
+    for(size_t i=0;i<digest.size();++i)std::snprintf(hex+2*i,3,"%02x",digest[i]);
+    return std::string_view(hex)=="04f6e18f5b08bfee0411e2e75897b7dea74f9baf83148e84dc59516ebab58913";
+}
+
+bool TrustedFile(const std::filesystem::path& path) {
+    WINTRUST_FILE_INFO file{sizeof(file)};
+    file.pcwszFilePath=path.c_str();
+    WINTRUST_DATA data{sizeof(data)};
+    data.dwUIChoice=WTD_UI_NONE;
+    data.dwUnionChoice=WTD_CHOICE_FILE;
+    data.pFile=&file;
+    GUID policy=WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    return WinVerifyTrust(nullptr,&policy,&data)==ERROR_SUCCESS;
+}
+
+struct ServiceHandle {
+    SC_HANDLE h{};
+    ~ServiceHandle(){ if(h)CloseServiceHandle(h); }
+};
+
+int EnsureFilter() {
+    auto system=SystemFolder();
+    if(system.empty())return DriverSetupError;
+    const auto dest=system/L"drivers"/VendorFile;
+    if(GetFileAttributesW(dest.c_str())==INVALID_FILE_ATTRIBUTES){
+        auto bytes=ReadRepositoryFile(VendorPath,65536);
+        if(!bytes)return DriverPackageMissing;
+        if(!ApprovedBytes(*bytes))return DriverSetupError;
+        StagingDirectory stage;
+        if(!stage.Create(system))return DriverSetupError;
+        const auto file=stage.path/VendorFile;
+        HANDLE h=CreateFileW(file.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+        if(h==INVALID_HANDLE_VALUE)return DriverSetupError;
+        DWORD written{};
+        BOOL ok=WriteFile(h,bytes->data(),static_cast<DWORD>(bytes->size()),&written,nullptr);
+        CloseHandle(h);
+        if(!ok || written!=bytes->size() || !TrustedFile(file))return DriverSetupError;
+        if(!DirewolfPresent())return DriverDeviceMissing;
+        if(!CopyFileW(file.c_str(),dest.c_str(),TRUE) && GetLastError()!=ERROR_FILE_EXISTS)return DriverSetupError;
+    }
+    if(!TrustedFile(dest))return DriverSetupError;
+    ServiceHandle scm{OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT|SC_MANAGER_CREATE_SERVICE)};
+    if(!scm.h)return DriverSetupError;
+    constexpr DWORD rights=SERVICE_START|SERVICE_QUERY_STATUS;
+    ServiceHandle service{OpenServiceW(scm.h,VendorFile,rights)};
+    if(!service.h && GetLastError()==ERROR_SERVICE_DOES_NOT_EXIST){
+        service.h=CreateServiceW(scm.h,VendorFile,VendorFile,rights,SERVICE_KERNEL_DRIVER,SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL,L"\\SystemRoot\\System32\\drivers\\Xbox360Filter64.sys",nullptr,nullptr,L"FltMgr\0",nullptr,nullptr);
+    }
+    if(!service.h)return DriverSetupError;
+    SERVICE_STATUS status{};
+    if(!QueryServiceStatus(service.h,&status))return DriverSetupError;
+    if(status.dwCurrentState==SERVICE_RUNNING)return 0;
+    const wchar_t* key=L"SYSTEM\\CurrentControlSet\\Services\\Xbox360Filter64.sys\\Instances";
+    const wchar_t instance[]=L"Xbox360Filter64.sys Instance";
+    const wchar_t altitude[]=L"396999";
+    DWORD flags{};
+    const auto child=std::wstring(key)+L"\\"+instance;
+    if(RegSetKeyValueW(HKEY_LOCAL_MACHINE,key,L"DefaultInstance",REG_SZ,instance,sizeof(instance)) ||
+       RegSetKeyValueW(HKEY_LOCAL_MACHINE,child.c_str(),L"Altitude",REG_SZ,altitude,sizeof(altitude)) ||
+       RegSetKeyValueW(HKEY_LOCAL_MACHINE,child.c_str(),L"Flags",REG_DWORD,&flags,sizeof(flags)))return DriverSetupError;
+    if(!StartServiceW(service.h,0,nullptr) && GetLastError()!=ERROR_SERVICE_ALREADY_RUNNING)return DriverSetupError;
+    return 0;
+}
+int InstallVendorSampler() {
+    const auto resource=FindResourceW(nullptr,MAKEINTRESOURCEW(301),RT_RCDATA);
+    const DWORD size=resource?SizeofResource(nullptr,resource):0;
+    const void* bytes=resource?LockResource(LoadResource(nullptr,resource)):nullptr;
+    if(!size || !bytes)return DriverSetupError;
+    const auto dest=SystemFolder()/ReaderName;
+    StagingDirectory stage;
+    if(!stage.Create(SystemFolder()))return DriverSetupError;
+    const auto temporary=stage.path/ReaderName;
+    HANDLE h=CreateFileW(temporary.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h==INVALID_HANDLE_VALUE)return DriverSetupError;
+    DWORD written{};
+    const bool ok=WriteFile(h,bytes,size,&written,nullptr) && written==size;
+    CloseHandle(h);
+    if(!ok || !MoveFileExW(temporary.c_str(),dest.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){
+        DeleteFileW(temporary.c_str());
+        return DriverSetupError;
+    }    const std::wstring task=L"/TN \""+std::wstring(TaskName)+L"\"";
+    // System32 is protected. Only this embedded, argument-free reader runs elevated.
+    if(TaskCommand(L"/Create /F "+task+L" /SC MINUTE /MO 1 /RU SYSTEM /TR \"\\\""+
+                           dest.wstring()+L"\\\"\"")!=0){
+        // Keep the installed reader for a retry or an existing scheduled task.
+        return DriverSetupError;
+    }
+    if(TaskCommand(L"/Run "+task)!=0)return DriverSetupError;
+    DWORD enabled=1;
+    return RegSetKeyValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Battery Monitor\\Flydigi",L"AutoPoll",
+        REG_DWORD,&enabled,sizeof(enabled))==ERROR_SUCCESS ? 0 : DriverSetupError;
+}
+}
+
+bool VendorFilterInstalled(){
+    auto path=SystemFolder()/L"drivers"/L"Xbox360Filter64.sys";
+    return GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES;
+}
+bool VendorSamplerInstalled(){
+    DWORD enabled{},size=sizeof(enabled);
+    if(RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Battery Monitor\\Flydigi",L"AutoPoll",RRF_RT_REG_DWORD,nullptr,&enabled,&size)!=ERROR_SUCCESS || !enabled)return false;
+    auto path=SystemFolder()/ReaderName;
+    return GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES;
+}
 HANDLE StartDirewolfDriverInstall(HWND owner, DWORD& error) {
     std::wstring self(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, self.data(), DWORD(self.size()));
@@ -134,36 +253,7 @@ int InstallDirewolfDriver() {
     if (!DirewolfPresent()) return DriverDeviceMissing;
     if (DirewolfDriverPresent()) return 0;
     if (!IsAdministrator()) return ERROR_ELEVATION_REQUIRED;
-    if (!DirewolfPackagePublished()) return DriverPackageMissing;
-
-    wchar_t system[MAX_PATH]{};
-    const UINT length = GetSystemDirectoryW(system, UINT(std::size(system)));
-    if (!length || length >= std::size(system)) return DriverSetupError;
-    StagingDirectory staging;
-    if (!staging.Create(system)) return DriverSetupError;
-    if (!staging.Download()) return DriverPackageMissing;
-    const auto inf = staging.path / Package[0];
-    wchar_t extension[64]{};
-    GetPrivateProfileStringW(L"Version", L"ExtensionId", L"", extension, DWORD(std::size(extension)), inf.c_str());
-    if (_wcsicmp(extension, L"{d15c182e-1c2e-43c3-a8ed-1818491bc430}") != 0) return DriverSetupError;
-    SP_INF_SIGNER_INFO_W signer{};
-    signer.cbSize = sizeof(signer);
-    if (!SetupVerifyInfFileW(inf.c_str(), nullptr, &signer)) return DriverSetupError;
-
-    const auto exe = std::filesystem::path(system) / L"pnputil.exe";
-    auto command = L"\"" + exe.wstring() + L"\" /add-driver \"" + inf.wstring() + L"\" /install";
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    if (!DirewolfPresent()) return DriverDeviceMissing;
-    if (DirewolfDriverPresent()) return 0;
-    if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-                        nullptr, nullptr, &startup, &process)) return DriverSetupError;
-    CloseHandle(process.hThread);
-    DWORD status = DriverSetupError;
-    if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0)
-        GetExitCodeProcess(process.hProcess, &status);
-    CloseHandle(process.hProcess);
-    if (!status && !DirewolfDriverPresent()) return ERROR_SUCCESS_REBOOT_REQUIRED;
-    return static_cast<int>(status);
+    const int status=EnsureFilter();
+    if(status)return status;
+    return InstallVendorSampler();
 }
