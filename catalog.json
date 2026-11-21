@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "profiles": [
+    {"file": "10-vxe-r1-nearlink.json", "vid": 14139, "pids": [4297, 4295], "pages": [65282, 65284], "usage": 2},
+    {"file": "20-razer-barracuda-x.json", "vid": 5426, "pids": [1358], "pages": [65280], "usage": 1},
+    {"file": "30-flydigi-direwolf-4.json", "vid": 1118, "pids": [654], "usbSerial": "Flydigi_Direwolf_4"}
+  ]
+}

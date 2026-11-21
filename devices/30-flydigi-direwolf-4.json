@@ -1,0 +1,9 @@
+{
+  "name": "Flydigi Direwolf 4",
+  "kind": "gamepad",
+  "connection": "2,4 ГГц · USB-приёмник",
+  "protocol": "gamepad",
+  "vid": 1118,
+  "pids": [654],
+  "usbSerial": "Flydigi_Direwolf_4"
+}

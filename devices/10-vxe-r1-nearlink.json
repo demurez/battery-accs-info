@@ -1,0 +1,17 @@
+{
+  "name": "VXE R1 NearLink",
+  "kind": "mouse",
+  "connection": "NearLink / USB",
+  "protocol": "hid-output",
+  "vid": 14139,
+  "pids": [4297, 4295],
+  "pages": [65282, 65284],
+  "usage": 2,
+  "request": [8, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 73],
+  "replyId": 8,
+  "batteryOffset": 6,
+  "powerOffset": 7,
+  "minimum": 1,
+  "delayMs": 150,
+  "timeoutMs": 1000
+}

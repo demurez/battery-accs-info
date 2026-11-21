@@ -1,0 +1,7 @@
+/build/
+/dist/
+/ATK_tray-master/
+/test_airoha.py
+/native/probe.cpp
+/native/gameinput_probe.cpp
+__pycache__/

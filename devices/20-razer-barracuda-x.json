@@ -1,0 +1,12 @@
+{
+  "name": "Razer Barracuda X",
+  "kind": "headset",
+  "connection": "2,4 ГГц · 2021",
+  "protocol": "airoha-ystech",
+  "vid": 5426,
+  "pids": [1358],
+  "pages": [65280],
+  "usage": 1,
+  "timeoutMs": 800,
+  "voltageCurve": [3300, 3680, 3750, 3790, 3830, 3870, 3910, 3960, 4020, 4080, 4150]
+}
