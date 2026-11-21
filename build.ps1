@@ -45,7 +45,15 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Flydigi reader compilation failed.' }
         $resourceScript = Join-Path $objects 'flydigi-reader.rc'
         $reader = (Join-Path $output 'FlydigiSample.exe').Replace('\','/')
-        Set-Content -LiteralPath $resourceScript -Value ('301 RCDATA "' + $reader + '"') -Encoding unicode
+        $defaults = @(Get-ChildItem (Join-Path $projectRoot 'devices') -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
+            @{ file = $_.Name; profile = [IO.File]::ReadAllText($_.FullName) }
+        })
+        $bundle = Join-Path $objects 'bundled-profiles.json'
+        [IO.File]::WriteAllText($bundle, (ConvertTo-Json -InputObject $defaults -Compress))
+        Set-Content -LiteralPath $resourceScript -Value @(
+            ('301 RCDATA "' + $reader + '"')
+            ('302 RCDATA "' + $bundle.Replace('\','/') + '"')
+        ) -Encoding unicode
         & rc.exe /nologo /fo flydigi-reader.res $resourceScript
         if ($LASTEXITCODE -ne 0) { throw 'Embedding the Flydigi reader failed.' }
         & cl.exe @compiler 'flydigi-reader.res' (Join-Path $projectRoot 'native\app.cpp') (Join-Path $projectRoot 'native\profile_catalog.cpp') 'flydigi_station.obj' 'devices.obj' 'notifications.obj' 'driver_install.obj' 'github_download.obj' @systemLibraries 'd2d1.lib' 'dwrite.lib' 'dwmapi.lib' 'user32.lib' 'gdi32.lib' "/Fe$output\BatteryMonitor.exe" /link /SUBSYSTEM:WINDOWS

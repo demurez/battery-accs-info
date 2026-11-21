@@ -481,8 +481,10 @@ Profile ParseProfile(std::string_view raw, std::wstring file) {
 
 std::vector<Profile> LoadProfiles(const std::filesystem::path& folder) {
     std::vector<std::filesystem::path> paths;
-    for (const auto& entry : std::filesystem::directory_iterator(folder))
-        if (entry.is_regular_file() && entry.path().extension() == L".json") paths.push_back(entry.path());
+    if (std::filesystem::exists(folder)) {
+        for (const auto& entry : std::filesystem::directory_iterator(folder))
+            if (entry.is_regular_file() && entry.path().extension() == L".json") paths.push_back(entry.path());
+    }
     std::ranges::sort(paths);
     std::vector<Profile> profiles;
     for (const auto& path : paths) {
@@ -494,6 +496,19 @@ std::vector<Profile> LoadProfiles(const std::filesystem::path& folder) {
         } catch (...) {
             throw std::runtime_error("Invalid device profile: " + winrt::to_string(path.filename().wstring()));
         }
+    }
+    // Loose profiles override the portable defaults by filename.
+    if (auto resource = FindResourceW(nullptr, MAKEINTRESOURCEW(302), RT_RCDATA)) {
+        auto bytes = static_cast<const char*>(LockResource(LoadResource(nullptr, resource)));
+        if (!bytes) throw std::runtime_error("Cannot read bundled profiles");
+        auto bundle = JsonArray::Parse(winrt::to_hstring(std::string_view(bytes, SizeofResource(nullptr, resource))));
+        for (auto item : bundle) {
+            auto record = item.GetObject();
+            std::wstring file(record.GetNamedString(L"file"));
+            if (std::ranges::none_of(profiles, [&](const Profile& p) { return !_wcsicmp(p.file.c_str(), file.c_str()); }))
+                profiles.push_back(ParseProfile(winrt::to_string(record.GetNamedString(L"profile")), std::move(file)));
+        }
+        std::ranges::sort(profiles, {}, &Profile::file);
     }
     if (profiles.empty()) throw std::runtime_error("No JSON device profiles found");
     return profiles;
