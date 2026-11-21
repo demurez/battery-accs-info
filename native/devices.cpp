@@ -454,7 +454,10 @@ Profile ParseProfile(std::string_view raw, std::wstring file) {
     p.pids = Numbers(json, L"pids");
     p.pages = Numbers(json, L"pages");
     p.curve = Numbers(json, L"voltageCurve");
-    p.likelyChargingMv = Number(json,L"likelyChargingMv");
+    // Older cached profiles for the 2021 receiver predate this optional field.
+    const bool barracuda2021=p.protocol==L"airoha-ystech" && p.vid==0x1532 &&
+                             p.pids.size()==1 && p.pids.front()==0x054e;
+    p.likelyChargingMv = Number(json,L"likelyChargingMv",barracuda2021?4180:0);
     if(p.likelyChargingMv && (p.likelyChargingMv<4000 || p.likelyChargingMv>4500))
         throw std::runtime_error("Invalid charging voltage threshold");
     for (unsigned byte : Numbers(json, L"request")) {
