@@ -9,12 +9,15 @@
 struct Profile {
     std::wstring file, name, kind, connection, protocol, usbSerial;
     unsigned vid{}, usage{}, timeout{800}, delay{}, replyId{}, batteryOffset{}, powerOffset{};
-    unsigned minimum{}, millivoltsOffset{1};
+    unsigned minimum{}, millivoltsOffset{1}, likelyChargingMv{};
     std::vector<unsigned> pids, pages, curve;
     std::vector<unsigned char> request;
 };
 
-enum class PowerSource { Unknown, Battery, External, Charging };
+enum class PowerSource { Unknown, Battery, External, Charging, LikelyCharging };
+inline bool ChargingIndicator(PowerSource power) {
+    return power==PowerSource::Charging || power==PowerSource::LikelyCharging;
+}
 struct Reading {
     std::optional<int> percent;
     std::wstring status;

@@ -20,6 +20,8 @@
 | Razer Barracuda X (2021) | Запрос напряжения по Airoha RACE через донгл `1532:054E`. Процент рассчитывается по приближённой кривой Li-ion. |
 | Flydigi Direwolf 4 | Battery Monitor поддерживает чтение через свой USB-фильтр, когда подписанный пакет установлен. Без него выполняется проверка Windows.Gaming.Input и XUSB. Штатный XUSB в испытании вернул `BATTERY_TYPE_WIRED` без уровня заряда. |
 
+Для Barracuda X (2021) профиль показывает «Вероятно заряжается» при напряжении от 4180 мВ. В сравнительном тесте на одном экземпляре с подключённым кабелем получено 4203–4209 мВ, без кабеля — 4110 мВ, после повторного подключения — 4206 мВ. При меньшем напряжении гарнитура также может заряжаться. Показание ≈100% и начало разряда у этой модели приблизительные.
+
 Входные параметры Airoha и кривая напряжения также сверены с [описанием протокола Barracuda X](https://github.com/mehdibouchami/razer-barracuda-x-battery/blob/main/src/Protocol.cs). Приближение проверено на ответе донгла, точность калибровки версии 2021 отдельно не измерялась.
 
 Формат ответа XUSB сверён с [HIDMaestro](https://github.com/hifihedgehog/HIDMaestro/issues/61). [BatteryMonitor](https://github.com/JKWTCN/BatteryMonitor/blob/master/src/providers/xbox/FlydigiControllerReader.cpp) получает уровень Direwolf 4 через фирменную службу, которая в этом проекте не используется.

@@ -215,7 +215,9 @@ std::optional<Reading> Barracuda(HANDLE handle, const HidInterface& iface, const
         percent = static_cast<int>(std::lround((pos - p.curve.begin() - 1) * 10 +
                                                 10.0 * (mv - low) / (*pos - low)));
     }
-    return Reading{percent, L"Оценка по напряжению", true};
+    const bool likelyCharging=p.likelyChargingMv && mv>=p.likelyChargingMv;
+    return Reading{percent, likelyCharging?L"Вероятно заряжается · по напряжению":L"Оценка по напряжению",
+                   true, likelyCharging?PowerSource::LikelyCharging:PowerSource::Unknown};
 }
 
 std::optional<Reading> XusbBattery(const Profile& p, bool trace) {
@@ -452,6 +454,9 @@ Profile ParseProfile(std::string_view raw, std::wstring file) {
     p.pids = Numbers(json, L"pids");
     p.pages = Numbers(json, L"pages");
     p.curve = Numbers(json, L"voltageCurve");
+    p.likelyChargingMv = Number(json,L"likelyChargingMv");
+    if(p.likelyChargingMv && (p.likelyChargingMv<4000 || p.likelyChargingMv>4500))
+        throw std::runtime_error("Invalid charging voltage threshold");
     for (unsigned byte : Numbers(json, L"request")) {
         if (byte > 255) throw std::runtime_error("Invalid report byte");
         p.request.push_back(static_cast<unsigned char>(byte));

@@ -119,7 +119,7 @@ FullCharge LoadCharge(const std::wstring& profile) {
 
 void TrackCharge(FullCharge& history,const std::wstring& profile,const Reading& reading) {
     auto d=history.data;
-    bool external=reading.power==PowerSource::External || reading.power==PowerSource::Charging;
+    bool external=reading.power==PowerSource::External || ChargingIndicator(reading.power);
     const auto now=std::time(nullptr);
     bool running=false;
     if(external || reading.percent){
@@ -152,16 +152,16 @@ std::wstring LocalStamp(std::int64_t stamp) {
     if(!localtime_s(&local,&t))std::wcsftime(date,std::size(date),L"%d.%m %H:%M",&local);
     return date;
 }
-std::wstring ChargeLine(const FullCharge& history) {
+std::wstring ChargeLine(const FullCharge& history,bool voltageEstimate) {
     const auto& d=history.data;
-    if(!d.start)return d.armed?L"Полный заряд · ждём начала разряда":L"Ожидание полного цикла";
+    if(!d.start)return d.armed?(voltageEstimate?L"≈100% · ждём снижения уровня":L"Полный заряд · ждём начала разряда"):L"Ожидание полного цикла";
     auto seconds=d.seconds;
     const auto since=GetTickCount64()-history.previousTick;
     if(history.previousTick && since<=150000)seconds+=since/1000;
     const auto minutes=seconds/60;
     std::wstring duration=minutes>=60?std::to_wstring(minutes/60)+L" ч ":L"";
     duration+=std::to_wstring(minutes%60)+L" мин";
-    return L"На батарее "+duration+L" · с "+LocalStamp(d.start);
+    return (voltageEstimate?L"На батарее ≈":L"На батарее ")+duration+L" · с "+LocalStamp(d.start);
 }struct Card {
     Reading reading{{}, L"Ожидание данных"};
     std::optional<Reading> last;
@@ -762,7 +762,7 @@ private:
         const bool visible=(mainVisible && !IsIconic(window_)) || (hover_ && IsWindowVisible(hover_));
         BOOL motion=TRUE;
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&motion,0);
-        if(visible && motion && std::ranges::any_of(cards_,[](const Card& c){return c.reading.power==PowerSource::Charging;}))
+        if(visible && motion && std::ranges::any_of(cards_,[](const Card& c){return ChargingIndicator(c.reading.power);}))
             SetTimer(window_,ChargingTimer,100,nullptr);
         else KillTimer(window_,ChargingTimer);
         chargeMotion_=motion!=FALSE;
@@ -849,7 +849,7 @@ private:
             const unsigned accent=!c.reading.percent?theme_.secondary:*c.reading.percent<=20?theme_.amber:theme_.accent;
             band(10,y,width-10,y+83+extra,9,theme_.card);
             text(profiles_[i].name,name_.get(),RectF(22,y+6,width-96,y+30),theme_.text);
-            if(c.reading.power==PowerSource::Charging){
+            if(ChargingIndicator(c.reading.power)){
                 auto r=ChargeRadius();pen->SetColor(ColorF(theme_.accent));
                 rt->FillEllipse(D2D1::Ellipse(Point2F(width-96,y+16),r,r),pen.get());
             }
@@ -860,8 +860,8 @@ private:
             auto detail=profiles_[i].connection;
             if(!status.empty() && status!=detail)detail+=(detail.empty()?L"":L" · ")+status;
             text(detail,small_.get(),RectF(22,y+30,width-20,y+50),theme_.secondary);
-            text(ChargeLine(c.charge),small_.get(),RectF(22,y+49,width-20,y+68),theme_.secondary);
-            if(c.charge.data.full)text(L"Полный заряд · "+LocalStamp(c.charge.data.full),small_.get(),
+            text(ChargeLine(c.charge,profiles_[i].protocol==L"airoha-ystech"),small_.get(),RectF(22,y+49,width-20,y+68),theme_.secondary);
+            if(c.charge.data.full)text((profiles_[i].protocol==L"airoha-ystech"?L"Оценка 100% · ":L"Полный заряд · ")+LocalStamp(c.charge.data.full),small_.get(),
                                        RectF(22,y+67,width-20,y+85),theme_.secondary);
             band(22,y+72+extra,width-22,y+76+extra,2,theme_.track);
             if(level && *level>0)band(22,y+72+extra,22+(width-44)*(*level)/100.f,y+76+extra,2,accent);
@@ -1097,11 +1097,11 @@ private:
             else if (card.reading.status == L"Подключено") detail = profile.connection;
             else detail = card.reading.status;
             Text(detail, small_.get(), RectF(left, y + 39, detailRight, y + 60), theme_.secondary);
-            Text(ChargeLine(card.charge), small_.get(), RectF(left,y+60,right,y+81),theme_.secondary);
+            Text(ChargeLine(card.charge,profile.protocol==L"airoha-ystech"), small_.get(), RectF(left,y+60,right,y+81),theme_.secondary);
             const bool current = card.reading.percent.has_value();
             const auto chargeColor = !current ? theme_.secondary :
                                      *card.reading.percent <= 20 ? theme_.amber : theme_.accent;
-            if(!offer && card.reading.power==PowerSource::Charging){
+            if(!offer && ChargingIndicator(card.reading.power)){
                 brush_->SetColor(ColorF(theme_.accent));
                 const auto r=ChargeRadius();
                 render_->FillEllipse(D2D1::Ellipse(Point2F(right-83,y+23),r,r),brush_.get());
