@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
@@ -32,9 +33,9 @@ using D2D1::RoundedRect;
 
 constexpr wchar_t WindowClass[] = L"PeripheralCharge.Window";
 constexpr UINT BatteryReady = WM_APP + 1, TrayEvent = WM_APP + 2, SampleChanged = WM_APP + 3;
-constexpr UINT_PTR AnimationTimer = 1, PlugTimer = 2, DriverTimer = 4, FirstSampleTimer = 5;
+constexpr UINT_PTR AnimationTimer = 1, PlugTimer = 2, DriverTimer = 4, FirstSampleTimer = 5, HistoryTimer = 6;
 constexpr int Open = 101, Refresh = 102, Summary = 103, Quit = 104, Publish = 105, InstallDriver = 106;
-constexpr float Width = 536, Top = 119, Row = 94, Bottom = 54, Margin = 26;
+constexpr float Width = 536, Top = 119, Row = 116, Bottom = 54, Margin = 26;
 constexpr int InstallWidth = 154, InstallHeight = 32;
 
 struct Theme {
@@ -88,16 +89,59 @@ HICON BatteryIcon() {
     return icon;
 }
 
+struct FullCharge {
+    std::int64_t observed{}, atFull{};
+};
+
+constexpr wchar_t ChargeKey[]=L"Software\\PeripheralCharge\\FullCharge";
+
+FullCharge LoadCharge(const std::wstring& profile) {
+    FullCharge record{};
+    DWORD size=sizeof(record);
+    if(RegGetValueW(HKEY_CURRENT_USER,ChargeKey,profile.c_str(),RRF_RT_REG_BINARY,
+                    nullptr,&record,&size)!=ERROR_SUCCESS || size!=sizeof(record) ||
+       record.observed<0 || (record.atFull!=0 && record.atFull!=1)) return {};
+    return record;
+}
+
+void TrackCharge(FullCharge& record,const std::wstring& profile,const Reading& reading) {
+    if(!reading.percent)return;
+    bool full=*reading.percent==100;
+    if(full==bool(record.atFull))return;
+    auto next=record;
+    if(full)next.observed=std::time(nullptr);
+    next.atFull=full;
+    if(RegSetKeyValueW(HKEY_CURRENT_USER,ChargeKey,profile.c_str(),REG_BINARY,&next,sizeof(next))==ERROR_SUCCESS)
+        record=next;
+}
+
+std::wstring ChargeLine(const FullCharge& record) {
+    if(!record.observed)return L"100% ещё не зафиксировано";
+    std::tm local{};
+    const std::time_t stamp=record.observed;
+    if(localtime_s(&local,&stamp))return L"Дата зарядки недоступна";
+    wchar_t date[32]{};
+    std::wcsftime(date,std::size(date),L"%d.%m.%Y %H:%M",&local);
+    auto minutes=std::max<std::int64_t>(0,std::time(nullptr)-stamp)/60;
+    std::wstring age;
+    if(minutes>=1440)age=std::to_wstring(minutes/1440)+L" д "+std::to_wstring(minutes/60%24)+L" ч";
+    else if(minutes>=60)age=std::to_wstring(minutes/60)+L" ч "+std::to_wstring(minutes%60)+L" мин";
+    else if(minutes)age=std::to_wstring(minutes)+L" мин";
+    return L"100% · "+std::wstring(date)+L" · "+(age.empty()?L"только что":age+L" назад");
+}
 struct Card {
     Reading reading{{}, L"Ожидание данных"};
     std::optional<Reading> last;
+    FullCharge charge{};
     float from{}, to{};
 };
 
 class Monitor {
 public:
     explicit Monitor(std::vector<Profile> profiles)
-        : profiles_(std::move(profiles)), cards_(profiles_.size()), enabled_(SummaryEnabled()) {}
+        : profiles_(std::move(profiles)), cards_(profiles_.size()), enabled_(SummaryEnabled()) {
+        for(size_t i=0;i<cards_.size();++i) cards_[i].charge=LoadCharge(profiles_[i].file);
+    }
 
     ~Monitor() {
         {
@@ -109,6 +153,8 @@ public:
         StopSampleWatch();
 
         if (driverProcess_) CloseHandle(driverProcess_);
+        if(hover_ && IsWindow(hover_))DestroyWindow(hover_);
+        if(hoverFont_)DeleteObject(hoverFont_);
         if (icon_) DestroyIcon(icon_);
     }
 
@@ -146,6 +192,7 @@ public:
             EndPaint(window_, &paint);
             return 0;
         }
+        case WM_SHOWWINDOW: UpdateHistoryTimer(w != 0); break;
         case WM_ERASEBKGND: return 1;
         case WM_SIZE:
             if (render_ && w != SIZE_MINIMIZED) render_->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
@@ -198,7 +245,10 @@ public:
             }
             break;
         case WM_TIMER:
-            if (w == AnimationTimer) {
+            if (w == HistoryTimer) {
+                if(IsWindowVisible(window_)) InvalidateRect(window_,nullptr,FALSE);
+                if(hover_ && IsWindowVisible(hover_)) ShowHover();
+            } else if (w == AnimationTimer) {
                 if (!IsWindowVisible(window_) || IsIconic(window_) || Motion() >= 1)
                     KillTimer(window_, AnimationTimer);
                 if (IsWindowVisible(window_) && !IsIconic(window_)) InvalidateRect(window_, nullptr, FALSE);
@@ -241,6 +291,8 @@ public:
             return 0;
         }
         case TrayEvent:
+            if(LOWORD(l)==NIN_POPUPOPEN){ ShowHover(); return 0; }
+            if(LOWORD(l)==NIN_POPUPCLOSE){ if(hover_)ShowWindow(hover_,SW_HIDE); UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE); return 0; }
             if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT || LOWORD(l) == WM_LBUTTONUP)
                 Reveal();
             else if (LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_RBUTTONUP) TrayMenu();
@@ -341,6 +393,7 @@ private:
         for (size_t i = 0; i < updated.size(); ++i) {
             const auto previous = std::ranges::find(profiles_, updated[i].file, &Profile::file);
             if (previous != profiles_.end()) cards[i] = std::move(cards_[previous - profiles_.begin()]);
+            else cards[i].charge=LoadCharge(updated[i].file);
         }
         profiles_ = std::move(updated);
         cards_ = std::move(cards);
@@ -373,6 +426,7 @@ private:
             auto& card = cards_[i];
             card.from += (card.to - card.from) * previous;
             card.reading = std::move(values[i]);
+            TrackCharge(card.charge,profiles_[i].file,card.reading);
             if (int(i)==driverRow_ && card.reading.percent && firstSampleNotice_) {
                 firstSampleNotice_=nullptr;
                 KillTimer(window_, FirstSampleTimer);
@@ -393,6 +447,7 @@ private:
         wchar_t time[16]{};
         GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &now, L"HH:mm", time, int(std::size(time)));
         lastTime_ = time;
+        UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE);
         UpdateTray();
         if (enabled_) SendSummary(false);
         UpdateDriverOffer();
@@ -604,20 +659,85 @@ private:
 
     void UpdateTray(bool add = false) {
         auto tray = TrayData();
-        tray.uFlags = NIF_TIP | NIF_SHOWTIP | NIF_ICON | NIF_MESSAGE;
+        tray.uFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE;
         tray.uCallbackMessage = TrayEvent;
         tray.hIcon = icon_ ? icon_ : LoadIconW(nullptr, IDI_APPLICATION);
-        std::wstring tooltip = L"Заряд устройств";
-        for (size_t i = 0; i < std::min<size_t>(4, cards_.size()); ++i)
-            tooltip += L"\n" + profiles_[i].name + L"  " + CardValue(i) +
-                       (cards_[i].last && !cards_[i].reading.percent ? L" ранее" : L"");
-        wcsncpy_s(tray.szTip, tooltip.c_str(), _TRUNCATE);
+        wcscpy_s(tray.szTip,L"Battery Monitor");
+        if (hover_ && IsWindowVisible(hover_)) ShowHover();
         if (add) {
             trayAdded_ = Shell_NotifyIconW(NIM_ADD, &tray) != FALSE;
             if (trayAdded_) { tray.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &tray); }
         } else if (!Shell_NotifyIconW(NIM_MODIFY, &tray)) AddTray();
     }
 
+    HWND hover_{};
+    HFONT hoverFont_{};
+    int hoverDpi_{};
+
+    void UpdateHistoryTimer(bool mainVisible) {
+        const bool visible=mainVisible || (hover_ && IsWindowVisible(hover_));
+        if(visible && std::ranges::any_of(cards_,[](const Card& card){return card.charge.observed!=0;}))
+            SetTimer(window_,HistoryTimer,60000,nullptr);
+        else KillTimer(window_,HistoryTimer);
+    }
+
+    void ShowHover() {
+        auto tray=TrayData();
+        NOTIFYICONIDENTIFIER id{sizeof(id)};
+        id.hWnd=tray.hWnd;
+        id.uID=tray.uID;
+        RECT icon{};
+        if(FAILED(Shell_NotifyIconGetRect(&id,&icon))){
+            POINT point{}; GetCursorPos(&point);
+            icon={point.x,point.y,point.x+1,point.y+1};
+        }
+        MONITORINFO monitor{sizeof(monitor)};
+        GetMonitorInfoW(MonitorFromRect(&icon,MONITOR_DEFAULTTONEAREST),&monitor);
+        const auto work=monitor.rcWork;
+        if(!hover_) hover_=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,
+            L"EDIT",nullptr,WS_POPUP|WS_BORDER|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|WS_VSCROLL,
+            icon.left,icon.top,1,1,window_,nullptr,GetModuleHandleW(nullptr),nullptr);
+        if(!hover_)return;
+        int dpi=GetDpiForWindow(hover_);
+        if(dpi!=hoverDpi_){
+            HFONT font=CreateFontW(-MulDiv(14,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+            if(font){SendMessageW(hover_,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+                if(hoverFont_)DeleteObject(hoverFont_); hoverFont_=font;hoverDpi_=dpi;}
+        }
+        std::wstring info;
+        for(size_t i=0;i<cards_.size();++i){
+            auto& card=cards_[i];
+            if(i)info+=L"\r\n\r\n";
+            info+=profiles_[i].name+L"   "+CardValue(i);
+            if(card.last && !card.reading.percent)info+=L" (ранее)";
+            info+=L"\r\n"+profiles_[i].connection;
+            auto status=(int(i)==driverRow_ && firstSampleNotice_ && !card.reading.percent)?
+                std::wstring(firstSampleNotice_):card.reading.status;
+            if(!status.empty() && status!=profiles_[i].connection)info+=L" · "+status;
+            info+=L"\r\n"+ChargeLine(card.charge);
+        }
+        if(!lastTime_.empty())info+=L"\r\n\r\nПроверено в "+lastTime_;
+        const int width=std::min<int>(work.right-work.left,MulDiv(420,dpi,96));
+        const int pad=MulDiv(10,dpi,96);
+        HDC dc=GetDC(hover_);
+        auto old=SelectObject(dc,hoverFont_);
+        RECT text{0,0,width-2*pad-GetSystemMetrics(SM_CXVSCROLL)-4,0};
+        DrawTextW(dc,info.c_str(),-1,&text,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX|DT_EDITCONTROL);
+        SelectObject(dc,old);ReleaseDC(hover_,dc);
+        const int height=std::min<int>(work.bottom-work.top,text.bottom+2*pad+6);
+        int x=std::clamp<int>((icon.left+icon.right-width)/2,work.left,work.right-width);
+        int y=icon.top-height-4;
+        if(y<work.top)y=icon.bottom+4;
+        y=std::clamp<int>(y,work.top,work.bottom-height);
+        SetWindowPos(hover_,HWND_TOPMOST,x,y,width,height,SWP_NOACTIVATE);
+        RECT inner{pad,pad,width-pad-GetSystemMetrics(SM_CXVSCROLL),height-pad};
+        SendMessageW(hover_,EM_SETRECT,0,reinterpret_cast<LPARAM>(&inner));
+        SetWindowTextW(hover_,info.c_str());
+        ShowScrollBar(hover_,SB_VERT,text.bottom>height-2*pad);
+        ShowWindow(hover_,SW_SHOWNOACTIVATE);
+        UpdateHistoryTimer(IsWindowVisible(window_)!=FALSE);
+    }
     void AddTray() { UpdateTray(true); }
 
     void Reveal() {
@@ -650,10 +770,10 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
+    static D2D1_RECT_F RefreshBounds() { return RectF(Width-Margin-120,26,Width-Margin,62); }
     bool IsRefreshPoint(int x, int y) const {
         float dpi = float(GetDpiForWindow(window_)) / 96;
-        return x >= (Width - 146) * dpi && x <= (Width - Margin) * dpi &&
-               y >= 31 * dpi && y <= 67 * dpi;
+        const auto r=RefreshBounds(); return x>=r.left*dpi && x<=r.right*dpi && y>=r.top*dpi && y<=r.bottom*dpi;
     }
 
     float Motion() const {
@@ -756,17 +876,21 @@ private:
             count += L"  ·  " + std::to_wstring(scroll_ + 1) + L"–" + std::to_wstring(scroll_ + VisibleRows());
         Text(count, small_.get(), RectF(Margin, 77, Width - Margin, 104), theme_.secondary);
 
-        Round(RectF(Width - 146, 31, Width - Margin, 67), 9, theme_.button);
-        Text(refreshing_ ? L"Проверка…" : L"Обновить", header_.get(),
-             RectF(Width - 132, 39, Width - 34, 62), theme_.text);
+        const auto button=RefreshBounds();
+        Round(button,9,theme_.button);
+        header_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        header_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        brush_->SetColor(ColorF(theme_.text));
+        const std::wstring_view caption=refreshing_?L"Проверка…":L"Обновить";
+        render_->DrawText(caption.data(),UINT32(caption.size()),header_.get(),button,brush_.get());
         float motion = Motion();
         for (int i = 0; i < VisibleRows(); ++i) {
             size_t index = size_t(scroll_ + i);
             auto& card = cards_[index];
             auto& profile = profiles_[index];
             float y = Top + Row * i;
-            Round(RectF(Margin, y, Width - Margin, y + 84), 13, theme_.card);
-            Round(RectF(Margin, y, Width - Margin, y + 84), 13, theme_.border, true);
+            Round(RectF(Margin, y, Width - Margin, y + 106), 13, theme_.card);
+            Round(RectF(Margin, y, Width - Margin, y + 106), 13, theme_.border, true);
             Round(RectF(Margin + 14, y + 16, Margin + 56, y + 58), 11, theme_.iconBg);
             Symbol(profile.kind, Margin + 14, y + 16);
             float left = Margin + 69, right = Width - Margin - 15;
@@ -782,14 +906,15 @@ private:
             else if (card.reading.status == L"Подключено") detail = profile.connection;
             else detail = card.reading.status;
             Text(detail, small_.get(), RectF(left, y + 39, detailRight, y + 60), theme_.secondary);
+            Text(ChargeLine(card.charge), small_.get(), RectF(left,y+60,right,y+81),theme_.secondary);
             const bool current = card.reading.percent.has_value();
             const auto chargeColor = !current ? theme_.secondary :
                                      *card.reading.percent <= 20 ? theme_.amber : theme_.accent;
             if (!offer)
                 Text(CardValue(index), percent_.get(), RectF(right - 88, y + 7, right, y + 38), chargeColor, true);
-            Round(RectF(left, y + 66, right, y + 71), 2.5f, theme_.track);
+            Round(RectF(left, y + 88, right, y + 93), 2.5f, theme_.track);
             float fill = (card.from + (card.to - card.from) * motion) / 100 * (right - left);
-            if (fill > 0) Round(RectF(left, y + 66, left + fill, y + 71), 2.5f, chargeColor);
+            if (fill > 0) Round(RectF(left, y + 88, left + fill, y + 93), 2.5f, chargeColor);
         }
         const float foot = Top + Row * VisibleRows() + 8;
         const auto footer = summaryFailed_ ? L"Сводка Windows недоступна" :
